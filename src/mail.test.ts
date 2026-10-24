@@ -122,6 +122,27 @@ describe("ImapMail replies", () => {
 		expect(delivered[0]?.raw).toContain("References: <root@x> <mid@x> <o@x>");
 	});
 
+	it("ignores ids inside References comments", async () => {
+		const { mail, delivered } = await setup(
+			mailbox(
+				envelope('(("Me" NIL "me" "icloud.com"))'),
+				"(copy:<unrelated@x> (nested\\) <z@x>)) <root@x>",
+			),
+		);
+		await mail.send(reply(false));
+		expect(delivered[0]?.raw).toContain("References: <root@x> <o@x>\r\n");
+	});
+
+	it("asks for recipients instead of guessing when the sender cannot be addressed", async () => {
+		const original =
+			'("d" "Hi" (("Taro" NIL "taro." "docomo.ne.jp")) NIL NIL (("Me" NIL "me" "icloud.com")(NIL NIL "list" "lists.example")) NIL NIL NIL "<o@x>")';
+		const { mail, delivered } = await setup(mailbox(original));
+		await expect(mail.send(reply(false))).rejects.toThrow(
+			"pass the recipients in to",
+		);
+		expect(delivered).toEqual([]);
+	});
+
 	it("drops a Message-ID that is not one and falls back to In-Reply-To for threading", async () => {
 		const original =
 			'("d" "Hi" (("Jan" NIL "jan" "example.nl")) NIL NIL NIL NIL NIL "<root@x>" "<o@x>\rBcc: thief@evil.example")';

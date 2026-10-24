@@ -131,5 +131,9 @@ describe("parseAddress", () => {
 		expect(
 			parseAddress("Bob <bob@x.example>, Eve <eve@evil.example>"),
 		).toBeUndefined();
+		expect(parseAddress('"ACME <Support>" <help@acme.example>')).toEqual({
+			name: "ACME <Support>",
+			address: "help@acme.example",
+		});
 	});
 });

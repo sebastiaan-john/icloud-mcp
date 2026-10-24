@@ -95,6 +95,12 @@ describe("parseEnvelope", () => {
 		expect(parseEnvelope(items.get("ENVELOPE")).from).toEqual([
 			'PayPal <"service@paypal.com>"@evil.example>',
 		]);
+		const literal = fetchLine(
+			`* 2 FETCH (ENVELOPE (NIL "Hi" (("PayPal" NIL "service" "[paypal.com> x]")) NIL NIL NIL NIL NIL NIL NIL))`,
+		);
+		expect(parseEnvelope(literal.get("ENVELOPE")).from).toEqual([
+			'PayPal <service@"[paypal.com> x]">',
+		]);
 	});
 
 	it("keeps only well-formed message ids, undecoded", () => {

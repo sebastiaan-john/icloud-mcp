@@ -42,8 +42,8 @@ export function parseAddress(
 	if (
 		open === -1 ||
 		!ADDR_SPEC.test(address) ||
-		// A name holding `<` or `>` is a second address squeezed into one entry.
-		/[<>]/.test(rawName) ||
+		// An unquoted name holding `<` or `>` is a second address squeezed in.
+		(!/^\s*".*"\s*$/s.test(rawName) && /[<>]/.test(rawName)) ||
 		// oxlint-disable-next-line no-control-regex -- a display name must not break a header line
 		/[\x00-\x1f\x7f]/.test(rawName)
 	) {

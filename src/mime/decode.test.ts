@@ -108,7 +108,7 @@ describe("htmlToText", () => {
 		const html = `<html><head><meta charset="utf-8"><body>
 			<div style="max-width:600px;overflow:hidden"><p>Order 1234 shipped</p></div>
 			<span aria-hidden="true">★</span><div class="hidden-xs">Desktop offer</div>
-			<p>If a < b then <b>bold</b></p></body></html>`;
+			<p>If a < b then <b>bold</b><?xml:namespace prefix = o /><o:p></o:p></p></body></html>`;
 		expect(htmlToText(html)).toBe(
 			"Order 1234 shipped\n\n★\nDesktop offer\n\nIf a < b then bold",
 		);

@@ -290,8 +290,8 @@ export function htmlToText(html: string): string {
 		const lt = html.indexOf("<", i);
 		out += html.slice(i, lt === -1 ? html.length : lt);
 		if (lt === -1) break;
-		// A `<` that cannot start a tag, as in `a < b`, is text.
-		if (!/[a-z/!]/i.test(html[lt + 1] ?? "")) {
+		// A `<` that cannot start a tag or `<?xml ...?>`, as in `a < b`, is text.
+		if (!/[a-z/!?]/i.test(html[lt + 1] ?? "")) {
 			out += "<";
 			i = lt + 1;
 			continue;

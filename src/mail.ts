@@ -436,13 +436,19 @@ export class ImapMail implements Mail {
 		// Addresses from the original that would not survive composing are left out.
 		const usable = (list: string[]) =>
 			list.filter((a) => addressKey(a) !== undefined);
-		const answerTo = usable(
-			envelope.replyTo.length ? envelope.replyTo : envelope.from,
-		);
-		// Answering your own message goes to its recipients, as mail clients do.
-		const others = answerTo.filter((a) => !self.has(addressKey(a)));
+		const sender = envelope.replyTo.length ? envelope.replyTo : envelope.from;
 		let to = draft.to;
-		if (to.length === 0) to = others.length ? others : usable(envelope.to);
+		if (to.length === 0) {
+			const answerTo = usable(sender);
+			if (answerTo.length < sender.length) {
+				throw new Error(
+					`Cannot reply to ${sender.join(", ")} automatically; pass the recipients in to.`,
+				);
+			}
+			// Answering your own message goes to its recipients, as mail clients do.
+			const others = answerTo.filter((a) => !self.has(addressKey(a)));
+			to = others.length ? others : usable(envelope.to);
+		}
 		const taken = new Set([...to, ...draft.cc, ...draft.bcc].map(addressKey));
 		const cc = [...draft.cc];
 		if (reply.all) {
@@ -487,13 +493,37 @@ function threadReferences(
 	header: string,
 	envelope: { inReplyTo?: string; messageId?: string },
 ): string[] {
-	// Ids may be glued together or followed by comments, so pick out each <...>.
-	const ids = (header.match(/<[^<>\s]+>/g) ?? []).filter((id) =>
-		MESSAGE_ID.test(id),
+	// Ids may be glued together; ids inside (comments) are not references.
+	const ids = (withoutComments(header).match(/<[^<>\s]+>/g) ?? []).filter(
+		(id) => MESSAGE_ID.test(id),
 	);
 	if (ids.length === 0 && envelope.inReplyTo) ids.push(envelope.inReplyTo);
 	if (envelope.messageId) ids.push(envelope.messageId);
 	return ids.length > 20 ? [...ids.slice(0, 1), ...ids.slice(-19)] : ids;
+}
+
+/** Removes RFC 5322 comments, nested and with `\)` escapes, outside `<...>`. */
+function withoutComments(value: string): string {
+	let out = "";
+	let depth = 0;
+	let inId = false;
+	for (let i = 0; i < value.length; i++) {
+		const char = value[i];
+		if (depth > 0) {
+			if (char === "\\") i++;
+			else if (char === "(") depth++;
+			else if (char === ")" && --depth === 0) out += " ";
+			continue;
+		}
+		if (char === "(" && !inId) {
+			depth = 1;
+			continue;
+		}
+		if (char === "<") inId = true;
+		if (char === ">") inId = false;
+		out += char;
+	}
+	return out;
 }
 
 /**

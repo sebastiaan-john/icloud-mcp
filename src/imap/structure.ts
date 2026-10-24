@@ -32,9 +32,17 @@ export interface BodyPart {
  */
 export const MESSAGE_ID = /^<[\x21-\x3b\x3d\x3f-\x7e]{1,250}>$/;
 
+/** A host that is a plain domain, not a `[...]` literal. */
+const DOMAIN = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/;
+
 /** A local part that needs no quoting (RFC 5322 dot-atom). */
 const DOT_ATOM =
 	/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
+
+/** Quotes an address part that is not in its plain form. */
+function quote(part: string, plain: RegExp): string {
+	return plain.test(part) ? part : `"${part.replace(/["\\]/g, "\\$&")}"`;
+}
 
 /** Formats an address as `Name <user@host>` or `user@host`. */
 function formatAddress(name: string | undefined, address: string): string {
@@ -54,12 +62,9 @@ function addresses(value: Value | undefined): string[] {
 		// Group syntax: a NIL host marks the start or end of a group.
 		if (host === null || host === undefined) continue;
 		// ENVELOPE strips the quotes from a local part such as
-		// "service@paypal.com>"; put them back so it cannot pose as an address.
-		const local = text(mailbox) ?? "";
-		const quoted = DOT_ATOM.test(local)
-			? local
-			: `"${local.replace(/["\\]/g, "\\$&")}"`;
-		const address = `${quoted}@${text(host) ?? ""}`;
+		// "service@paypal.com>"; put them back so it cannot pose as an
+		// address, and do the same for an odd host.
+		const address = `${quote(text(mailbox) ?? "", DOT_ATOM)}@${quote(text(host) ?? "", DOMAIN)}`;
 		const raw = text(name);
 		const display = raw === undefined ? undefined : decodeHeader(raw).trim();
 		out.push(formatAddress(display, address));
