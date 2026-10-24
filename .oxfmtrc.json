@@ -1,0 +1,27 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"useTabs": true,
+	"printWidth": 80,
+	"sortImports": {
+		"groups": [
+			[
+				"builtin",
+				"external"
+			],
+			[
+				"internal",
+				"subpath"
+			],
+			[
+				"parent",
+				"sibling",
+				"index"
+			],
+			"unknown"
+		],
+		"newlinesBetween": false
+	},
+	"ignorePatterns": [
+		"**/*.{md,json,jsonc,yml,yaml,toml}"
+	]
+}
