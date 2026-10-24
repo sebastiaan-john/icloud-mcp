@@ -1,13 +1,17 @@
 import type { Duplex } from "node:stream";
+import { errorMessage } from "../errors";
 import {
 	type CommandPart,
+	type ImapResponse,
 	parseResponse,
-	type Response,
 	ResponseFramer,
 } from "./wire";
 
-export type DataResponse = Extract<Response, { kind: "data" }>;
-export type StatusResponse = Extract<Response, { kind: "status" }>;
+export type DataResponse = Extract<ImapResponse, { kind: "data" }>;
+type StatusResponse = Extract<ImapResponse, { kind: "status" }>;
+
+/** How long LOGOUT may take before the socket is closed anyway. */
+const LOGOUT_MS = 2_000;
 
 export interface Result {
 	data: DataResponse[];
@@ -44,9 +48,9 @@ interface Pending {
 }
 
 /**
- * One IMAP connection over an already connected socket. Commands run one
- * batch at a time; untagged responses that arrive while a batch is in flight
- * belong to that batch.
+ * One IMAP connection over an already connected socket. The caller runs one
+ * batch at a time (ImapSession serializes); untagged responses that arrive
+ * while a batch is in flight belong to that batch.
  */
 export class ImapConnection {
 	/** The server greeting; rejects on BYE or if the socket closes first. */
@@ -57,7 +61,6 @@ export class ImapConnection {
 		reject(error: Error): void;
 	};
 	private pending?: Pending;
-	private queue: Promise<unknown> = Promise.resolve();
 	private nextTag = 1;
 	private failure?: Error;
 	private byeReceived = false;
@@ -87,10 +90,12 @@ export class ImapConnection {
 
 	/** Runs one command; rejects with ImapCommandError on NO or BAD. */
 	async exec(parts: CommandPart[]): Promise<Result> {
-		const name = commandName(parts);
-		const { data, statuses } = await this.enqueue([parts]);
-		const status = statuses[0]!;
-		if (status.status !== "OK") throw new ImapCommandError(name, status);
+		const { data, statuses } = await this.run([parts]);
+		const [status] = statuses;
+		if (!status) throw new ImapConnectionError("no reply");
+		if (status.status !== "OK") {
+			throw new ImapCommandError(commandName(parts), status);
+		}
 		return { data, status };
 	}
 
@@ -99,25 +104,26 @@ export class ImapConnection {
 	 * resolves once all are answered, NO and BAD included, in send order.
 	 */
 	pipeline(commands: string[]) {
-		return this.enqueue(commands.map((c) => [c]));
+		return this.run(commands.map((c) => [c]));
 	}
 
-	/** Sends LOGOUT when the connection is idle and closes the socket. */
+	/**
+	 * Sends LOGOUT and closes the socket, without waiting more than a moment
+	 * on a connection that may already be dead.
+	 */
 	async close(): Promise<void> {
 		if (this.closed) return;
-		await this.exec(["LOGOUT"]).catch(() => {});
+		const timer = new Promise((resolve) => {
+			setTimeout(resolve, LOGOUT_MS).unref();
+		});
+		await Promise.race([this.exec(["LOGOUT"]).catch(() => {}), timer]);
 		this.fail("logged out");
-	}
-
-	private enqueue(commands: CommandPart[][]) {
-		const run = () => this.run(commands);
-		const result = this.queue.then(run, run);
-		this.queue = result.catch(() => {});
-		return result;
 	}
 
 	private async run(commands: CommandPart[][]) {
 		if (this.failure) throw this.failure;
+		if (this.pending) throw new Error("IMAP connection is busy");
+		if (commands.length === 0) return { data: [], statuses: [] };
 		const tags = commands.map(() => `A${this.nextTag++}`);
 		const pending: Pending = {
 			tags: new Set(tags),
@@ -130,6 +136,7 @@ export class ImapConnection {
 			pending.resolve = resolve;
 			pending.reject = reject;
 		});
+		// Awaited below, but a failure during send() must not surface as unhandled.
 		done.catch(() => {});
 		this.pending = pending;
 		this.socket.setTimeout(this.timeoutMs);
@@ -141,7 +148,7 @@ export class ImapConnection {
 		} finally {
 			if (this.pending === pending) this.pending = undefined;
 		}
-		const statuses = tags.map((tag) => pending.statuses.get(tag)!);
+		const statuses = tags.map((tag) => pending.statuses.get(tag));
 		return { data: pending.data, statuses };
 	}
 
@@ -179,24 +186,22 @@ export class ImapConnection {
 		try {
 			responses = this.framer.push(chunk);
 		} catch (error) {
-			this.fail(error instanceof Error ? error.message : String(error));
+			this.fail(errorMessage(error));
 			return;
 		}
 		for (const bytes of responses) {
-			let response: Response;
+			let response: ImapResponse;
 			try {
 				response = parseResponse(bytes);
 			} catch (error) {
-				this.fail(
-					`unreadable response: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				this.fail(`unreadable response: ${errorMessage(error)}`);
 				return;
 			}
 			this.dispatch(response);
 		}
 	}
 
-	private dispatch(response: Response): void {
+	private dispatch(response: ImapResponse): void {
 		const waiter = this.greetingWaiter;
 		if (waiter) {
 			if (response.kind !== "status" || response.status === "BYE") {

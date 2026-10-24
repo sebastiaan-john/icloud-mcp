@@ -56,12 +56,7 @@ export function registerOrganizeTools(server: McpServer, mail: Mail) {
 						"Destination mailbox name as mail_list_mailboxes returns it",
 					),
 			}),
-			annotations: {
-				readOnlyHint: false,
-				destructiveHint: false,
-				idempotentHint: true,
-				openWorldHint: true,
-			},
+			annotations: IDEMPOTENT_WRITE,
 		},
 		async ({ mailbox, uids, to }) => {
 			const moved = await mail.move(mailbox, uids, to);

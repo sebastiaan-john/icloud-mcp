@@ -1,20 +1,30 @@
+import { isIP } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import type { ImapConfig } from "../config";
 import {
+	type DataResponse,
 	ImapCommandError,
 	ImapConnection,
 	ImapConnectionError,
 	type Result,
 } from "./connection";
-import { type CommandPart, mailboxArg, str } from "./wire";
+import {
+	type CommandPart,
+	pairs,
+	quoteMailbox,
+	str,
+	text,
+	type Value,
+} from "./wire";
 
 /** Opens the transport for a connection; tests swap in a plain socket. */
 export type Connect = (
 	config: ImapConfig,
 ) => ConstructorParameters<typeof ImapConnection>[0];
 
-const connectTls: Connect = (config) =>
-	tlsConnect({ host: config.host, port: config.port, servername: config.host });
+const connectTls: Connect = ({ host, port }) =>
+	// SNI takes a hostname; Bun refuses an IP address there.
+	tlsConnect({ host, port, servername: isIP(host) ? undefined : host });
 
 /** A logged-in connection that remembers its selected mailbox. */
 export class ImapClient {
@@ -29,34 +39,19 @@ export class ImapClient {
 		const connection = new ImapConnection(connect(config));
 		try {
 			const greeting = await connection.greeting;
-			let login: Result;
-			try {
-				login = await connection.exec([
-					"LOGIN",
-					str(config.user),
-					str(config.password),
-				]);
-			} catch (error) {
-				if (error instanceof ImapCommandError) {
-					throw new Error(
-						`The IMAP server rejected the login for ${config.user} (${error.response.text}). ` +
-							"For iCloud, ICLOUD_EMAIL must be your @icloud.com address and ICLOUD_APP_PASSWORD an app-specific password from account.apple.com.",
-						{ cause: error },
-					);
-				}
-				throw error;
+			let code = greeting.code;
+			if (greeting.status !== "PREAUTH") {
+				code = (await login(connection, config)).status.code;
 			}
-			let capabilities = parseCapabilities(login.status.code);
+			let capabilities = parseCapabilities(code);
 			if (capabilities.size === 0) {
 				const { data } = await connection.exec(["CAPABILITY"]);
 				capabilities = new Set(
 					data
 						.filter((d) => d.type === "CAPABILITY")
-						.flatMap((d) => d.values.map((v) => String(v).toUpperCase())),
+						.flatMap((d) => d.values.map((v) => text(v)?.toUpperCase() ?? "")),
 				);
 			}
-			if (capabilities.size === 0)
-				capabilities = parseCapabilities(greeting.code);
 			return new ImapClient(connection, capabilities);
 		} catch (error) {
 			await connection.close();
@@ -78,7 +73,7 @@ export class ImapClient {
 		// A failed SELECT leaves no mailbox open.
 		this.selected = undefined;
 		try {
-			await this.exec([writable ? "SELECT" : "EXAMINE", mailboxArg(mailbox)]);
+			await this.exec([writable ? "SELECT" : "EXAMINE", quoteMailbox(mailbox)]);
 		} catch (error) {
 			if (!(error instanceof ImapCommandError)) throw error;
 			throw new Error(
@@ -87,6 +82,27 @@ export class ImapClient {
 			);
 		}
 		this.selected = { mailbox, writable };
+	}
+
+	/** UID SEARCH in the selected mailbox. */
+	async uidSearch(criteria: CommandPart[]): Promise<number[]> {
+		const { data } = await this.exec(["UID SEARCH", ...criteria]);
+		return data
+			.filter((d) => d.type === "SEARCH")
+			.flatMap((d) => d.values.map((v) => Number(text(v))))
+			.filter(Number.isInteger);
+	}
+
+	/**
+	 * UID FETCH in the selected mailbox, keyed by UID. Unsolicited FETCH
+	 * responses without a UID, such as flag updates, are skipped.
+	 */
+	async uidFetch(
+		uids: number[],
+		items: string,
+	): Promise<Map<number, Map<string, Value>>> {
+		const { data } = await this.exec(["UID FETCH", uidSet(uids), `(${items})`]);
+		return byUid(data);
 	}
 
 	exec(parts: CommandPart[]): Promise<Result> {
@@ -99,6 +115,47 @@ export class ImapClient {
 
 	close(): Promise<void> {
 		return this.connection.close();
+	}
+}
+
+export function uidSet(uids: number[]): string {
+	return [...new Set(uids)].join(",");
+}
+
+function byUid(data: DataResponse[]): Map<number, Map<string, Value>> {
+	const messages = new Map<number, Map<string, Value>>();
+	for (const response of data) {
+		if (response.type !== "FETCH") continue;
+		const items = pairs(response.values[0]);
+		const uid = Number(text(items.get("UID")));
+		if (!Number.isInteger(uid)) continue;
+		const merged = messages.get(uid) ?? new Map<string, Value>();
+		for (const [key, value] of items) merged.set(key, value);
+		messages.set(uid, merged);
+	}
+	return messages;
+}
+
+/**
+ * Logs in. The rejection text comes from the server, which could echo what it
+ * was sent, so the password is cut out of it.
+ */
+async function login(connection: ImapConnection, config: ImapConfig) {
+	try {
+		return await connection.exec([
+			"LOGIN",
+			str(config.user),
+			str(config.password),
+		]);
+	} catch (error) {
+		if (!(error instanceof ImapCommandError)) throw error;
+		const reason = error.response.text.replaceAll(config.password, "***");
+		// No cause: its message is the unredacted server text.
+		// oxlint-disable-next-line preserve-caught-error
+		throw new Error(
+			`The IMAP server rejected the login for ${config.user} (${reason}). ` +
+				"For iCloud, ICLOUD_APP_PASSWORD must be an app-specific password from account.apple.com.",
+		);
 	}
 }
 
@@ -125,43 +182,55 @@ export class ImapSession {
 	) {}
 
 	/**
-	 * Runs `fn` with a logged-in client. When a reused connection turns out to
-	 * be dead, `fn` runs once more on a fresh one, unless `retry` is false
-	 * because repeating it could apply a write twice.
+	 * Runs `fn` with a logged-in client. When a reused connection turns out
+	 * to be dead, `fn` runs again on a fresh one. With `retry: false`, for
+	 * work that must not apply twice, a reused connection is checked with
+	 * NOOP first and `fn` runs exactly once.
 	 */
 	run<T>(
 		fn: (client: ImapClient) => Promise<T>,
 		{ retry = true } = {},
 	): Promise<T> {
-		const task = async () => {
+		return this.enqueue(async () => {
 			clearTimeout(this.idleTimer);
+			// A connection that failed is closed, so open() replaces it.
 			try {
+				if (!retry) return await fn(await this.open(true));
 				const reused = this.client !== undefined && !this.client.closed;
 				try {
-					return await fn(await this.open());
+					return await fn(await this.open(false));
 				} catch (error) {
-					if (!(error instanceof ImapConnectionError)) throw error;
-					this.client = undefined;
-					if (!reused || !retry) throw error;
-					return await fn(await this.open());
+					if (!(error instanceof ImapConnectionError) || !reused) throw error;
+					return await fn(await this.open(false));
 				}
 			} finally {
 				this.scheduleIdleClose();
 			}
-		};
+		});
+	}
+
+	/** Logs out once the calls already queued have finished. */
+	close(): Promise<void> {
+		clearTimeout(this.idleTimer);
+		return this.enqueue(async () => {
+			const client = this.client;
+			this.client = undefined;
+			await client?.close();
+		});
+	}
+
+	private enqueue<T>(task: () => Promise<T>): Promise<T> {
 		const result = this.tail.then(task, task);
 		this.tail = result.catch(() => {});
 		return result;
 	}
 
-	async close(): Promise<void> {
-		clearTimeout(this.idleTimer);
-		const client = this.client;
-		this.client = undefined;
-		await client?.close();
-	}
-
-	private async open(): Promise<ImapClient> {
+	private async open(probe: boolean): Promise<ImapClient> {
+		if (this.client && !this.client.closed && probe) {
+			await this.client.exec(["NOOP"]).catch((error: unknown) => {
+				if (!(error instanceof ImapConnectionError)) throw error;
+			});
+		}
 		if (this.client && !this.client.closed) return this.client;
 		this.client = await ImapClient.open(this.config, this.connect);
 		return this.client;
@@ -169,10 +238,7 @@ export class ImapSession {
 
 	private scheduleIdleClose(): void {
 		clearTimeout(this.idleTimer);
-		// Queued like any call, so it cannot close a connection that is in use.
-		this.idleTimer = setTimeout(() => {
-			this.tail = this.tail.then(() => this.close()).catch(() => {});
-		}, this.idleMs);
-		this.idleTimer.unref?.();
+		this.idleTimer = setTimeout(() => void this.close(), this.idleMs);
+		this.idleTimer.unref();
 	}
 }

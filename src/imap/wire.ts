@@ -5,12 +5,15 @@
  */
 export type Value = string | Uint8Array | null | Value[];
 
-export type Response =
+const STATUSES = ["OK", "NO", "BAD", "BYE", "PREAUTH"] as const;
+type Status = (typeof STATUSES)[number];
+
+export type ImapResponse =
 	| { kind: "continuation"; text: string }
 	| {
 			kind: "status";
 			tag: string;
-			status: "OK" | "NO" | "BAD" | "BYE" | "PREAUTH";
+			status: Status;
 			/** The bracketed response code without brackets, such as `APPENDUID 1 5`. */
 			code: string;
 			text: string;
@@ -19,8 +22,6 @@ export type Response =
 			kind: "data";
 			/** `FETCH`, `LIST`, `SEARCH`, `EXISTS`, and so on, uppercased. */
 			type: string;
-			/** The number before the type in `* 12 FETCH (...)`. */
-			number?: number;
 			values: Value[];
 	  };
 
@@ -35,11 +36,16 @@ const LF = 10;
 const SP = 32;
 const encoder = new TextEncoder();
 const utf8 = new TextDecoder();
-const STATUSES = new Set(["OK", "NO", "BAD", "BYE", "PREAUTH"]);
+
+function isStatus(word: string): word is Status {
+	return (STATUSES as readonly string[]).includes(word);
+}
 
 /**
  * Splits a byte stream into complete responses. A response ends at a CRLF
  * that is not followed by a literal announced as `{n}` right before it.
+ * Status and continuation lines never carry literals, so their free text
+ * may end in `{n}` without swallowing the next response.
  */
 export class ResponseFramer {
 	private buffer = new Uint8Array(64 * 1024);
@@ -47,6 +53,8 @@ export class ResponseFramer {
 	private end = 0;
 	/** Where to look for the next CRLF; past any literal already framed. */
 	private scan = 0;
+	/** Whether the current response has had a literal, so it is past its first line. */
+	private continued = false;
 
 	push(chunk: Uint8Array): Uint8Array[] {
 		this.append(chunk);
@@ -57,14 +65,19 @@ export class ResponseFramer {
 				this.scan = this.end;
 				break;
 			}
-			const literal = literalLength(this.buffer, this.start, lf);
+			const literal =
+				this.continued || !isTextLine(this.buffer, this.start, lf)
+					? literalLength(this.buffer, this.start, lf)
+					: undefined;
 			if (literal !== undefined) {
 				this.scan = lf + 1 + literal;
+				this.continued = true;
 				continue;
 			}
 			responses.push(this.buffer.slice(this.start, lf + 1));
 			this.start = lf + 1;
 			this.scan = this.start;
+			this.continued = false;
 		}
 		return responses;
 	}
@@ -89,6 +102,12 @@ export class ResponseFramer {
 	}
 }
 
+/** Whether a response's first line is a status or continuation, whose text is free-form. */
+function isTextLine(bytes: Uint8Array, start: number, lf: number): boolean {
+	const head = utf8.decode(bytes.subarray(start, Math.min(lf, start + 40)));
+	return /^(\+|\S+ (OK|NO|BAD|BYE|PREAUTH)\b)/i.test(head);
+}
+
 /** The length of a `{n}` or `{n+}` literal announced right before the line feed at `lf`. */
 function literalLength(
 	bytes: Uint8Array,
@@ -110,29 +129,27 @@ function literalLength(
 }
 
 /** Parses one complete response as produced by ResponseFramer. */
-export function parseResponse(bytes: Uint8Array): Response {
+export function parseResponse(bytes: Uint8Array): ImapResponse {
 	const reader = new Reader(bytes);
 	const tag = reader.word();
 	if (tag === "+") {
 		return { kind: "continuation", text: reader.rest() };
 	}
 	let word = reader.word();
-	let number: number | undefined;
-	if (tag === "*" && /^\d+$/.test(word)) {
-		number = Number(word);
-		word = reader.word();
-	}
+	const numbered = tag === "*" && /^\d+$/.test(word);
+	// `* 12 FETCH (...)`: the type follows the message number.
+	if (numbered) word = reader.word();
 	const upper = word.toUpperCase();
-	if (number === undefined && STATUSES.has(upper)) {
+	if (!numbered && isStatus(upper)) {
 		return {
 			kind: "status",
 			tag,
-			status: upper as "OK" | "NO" | "BAD" | "BYE" | "PREAUTH",
+			status: upper,
 			code: reader.code(),
 			text: reader.rest(),
 		};
 	}
-	return { kind: "data", type: upper, number, values: reader.values() };
+	return { kind: "data", type: upper, values: reader.values() };
 }
 
 class Reader {
@@ -232,19 +249,22 @@ class Reader {
 	}
 
 	/**
-	 * Reads an atom. Brackets are part of it, spaces and parens included, so
-	 * `BODY[HEADER.FIELDS (REFERENCES)]<0>` stays one token.
+	 * Reads an atom. In a section name such as
+	 * `BODY[HEADER.FIELDS (REFERENCES)]<0>` the brackets hold spaces and
+	 * parens; anywhere else, such as a keyword `a[b`, a bracket is plain text.
 	 */
 	private atom(): string {
 		const start = this.pos;
-		let depth = 0;
 		while (this.pos < this.bytes.length) {
 			const byte = this.bytes[this.pos]!;
-			if (byte === 0x5b) depth++;
-			else if (byte === 0x5d) depth--;
-			else if (depth === 0 && (byte === SP || byte === 0x28 || byte === 0x29)) {
+			if (byte === SP || byte === 0x28 || byte === 0x29 || isLineEnd(byte)) {
 				break;
-			} else if (isLineEnd(byte)) break;
+			}
+			if (byte === 0x5b && this.atSectionName(start)) {
+				const close = this.bytes.indexOf(0x5d, this.pos);
+				if (close === -1) throw new Error("Unterminated IMAP section name");
+				this.pos = close;
+			}
 			this.pos++;
 		}
 		if (this.pos === start) {
@@ -253,6 +273,11 @@ class Reader {
 			);
 		}
 		return utf8.decode(this.bytes.subarray(start, this.pos));
+	}
+
+	private atSectionName(start: number): boolean {
+		const name = utf8.decode(this.bytes.subarray(start, this.pos));
+		return /^(BODY|BINARY)(\.PEEK|\.SIZE)?$/i.test(name);
 	}
 
 	private skipSpaces(): void {
@@ -279,14 +304,29 @@ export function str(value: string): CommandPart {
  * Encodes a mailbox name argument in modified UTF-7 (RFC 3501 5.1.3), which
  * is always printable ASCII and so always fits a quoted string.
  */
-export function mailboxArg(name: string): string {
+export function quoteMailbox(name: string): string {
 	return `"${encodeMailbox(name).replace(/["\\]/g, "\\$&")}"`;
 }
 
+export const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(
+	" ",
+);
+
 /** Formats a date for SEARCH SINCE/BEFORE, e.g. `24-Oct-2026`. */
 export function searchDate(date: Date): string {
-	const months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
-	return `${date.getUTCDate()}-${months[date.getUTCMonth()]}-${date.getUTCFullYear()}`;
+	return `${date.getUTCDate()}-${MONTHS[date.getUTCMonth()]}-${date.getUTCFullYear()}`;
+}
+
+/** Turns an INTERNALDATE such as `24-Oct-2026 09:15:00 +0200` into `2026-10-24T09:15:00+02:00`. */
+export function internalDate(value: Value | undefined): string | undefined {
+	const match =
+		/^\s*(?<day>\d{1,2})-(?<month>\w{3})-(?<year>\d{4}) (?<time>\d\d:\d\d:\d\d) (?<zh>[+-]\d\d)(?<zm>\d\d)$/.exec(
+			text(value) ?? "",
+		);
+	const month = MONTHS.indexOf(match?.groups?.month ?? "") + 1;
+	if (!match?.groups || month === 0) return undefined;
+	const { day = "", year, time, zh, zm } = match.groups;
+	return `${year}-${String(month).padStart(2, "0")}-${day.padStart(2, "0")}T${time}${zh}:${zm}`;
 }
 
 /** Decodes a modified UTF-7 mailbox name such as `Verzonden &AOk-` into Unicode. */
@@ -321,12 +361,11 @@ export function text(value: Value | undefined): string | undefined {
 }
 
 /**
- * Turns a FETCH value list `(UID 5 FLAGS (\Seen) BODY[1] {3}...)` into a map
- * keyed by uppercased item name.
+ * Turns a key/value list such as FETCH's `(UID 5 FLAGS (\Seen) BODY[1] {3}...)`
+ * or STATUS's `(MESSAGES 3 UNSEEN 1)` into a map keyed by uppercased name.
  */
-export function fetchItems(values: Value[]): Map<string, Value> {
+export function pairs(list: Value | undefined): Map<string, Value> {
 	const items = new Map<string, Value>();
-	const list = values[0];
 	if (!Array.isArray(list)) return items;
 	for (let i = 0; i + 1 < list.length; i += 2) {
 		const key = list[i];

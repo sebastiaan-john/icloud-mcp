@@ -1,12 +1,13 @@
 import type { CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import type { AttachmentData, Mail } from "../mail";
+import { decodeCharset } from "../mime/decode";
 import { json, mailboxArg, READ_ONLY, uidArg } from "./common";
 
 const dateArg = (description: string) =>
-	z
-		.string()
-		.regex(/^\d{4}-\d{2}-\d{2}$/, "Use YYYY-MM-DD")
+	z.iso
+		.date()
+		.transform((day) => new Date(day))
 		.optional()
 		.describe(description);
 
@@ -20,13 +21,13 @@ const TEXT_TYPES =
 	/^(text\/|message\/rfc822$|application\/(json|xml|csv|ics|x-sh|javascript|yaml|x-yaml)$)/;
 
 /** Images come back as image content, text as text, anything else as a base64 resource. */
-export function attachmentContent(
+function attachmentContent(
 	mailbox: string,
 	uid: number,
 	part: string,
 	attachment: AttachmentData,
 ): CallToolResult {
-	const { contentType, data, filename } = attachment;
+	const { contentType, charset, data, filename } = attachment;
 	const label = `${filename ?? `part ${part}`} (${contentType}, ${data.length} bytes)`;
 	if (IMAGE_TYPES.has(contentType)) {
 		return {
@@ -43,7 +44,7 @@ export function attachmentContent(
 	if (TEXT_TYPES.test(contentType)) {
 		return {
 			content: [
-				{ type: "text", text: `${label}\n\n${new TextDecoder().decode(data)}` },
+				{ type: "text", text: `${label}\n\n${decodeCharset(data, charset)}` },
 			],
 		};
 	}
@@ -68,7 +69,7 @@ export function registerReadTools(server: McpServer, mail: Mail) {
 		{
 			title: "List mailboxes",
 			description:
-				"Every mailbox with its message and unread counts. `special_use` marks inbox, sent, drafts, trash, junk, and archive; iCloud names them for example `Sent Messages` and `Deleted Messages`.",
+				"Every mailbox with its message and unread counts. `special_use` marks inbox, sent, drafts, trash, junk, and archive; on iCloud those are named, for example, `Sent Messages` and `Deleted Messages`.",
 			annotations: READ_ONLY,
 		},
 		async () => json({ mailboxes: await mail.listMailboxes() }),
@@ -122,12 +123,10 @@ export function registerReadTools(server: McpServer, mail: Mail) {
 			annotations: READ_ONLY,
 		},
 		async ({ mailbox, limit, offset, ...query }) => {
-			const { total, messages } = await mail.search(
-				mailbox,
-				query,
+			const { total, messages } = await mail.search(mailbox, query, {
 				offset,
 				limit,
-			);
+			});
 			return json({
 				mailbox,
 				total,
@@ -143,7 +142,7 @@ export function registerReadTools(server: McpServer, mail: Mail) {
 		{
 			title: "Read message",
 			description:
-				"One message in full: headers, the body as plain text (HTML is converted, links kept as `text (url)`), and its attachments with the `part` to pass to mail_get_attachment. Does not mark the message read.",
+				"One message: headers, the body as plain text (HTML is converted, links kept as `text (url)`, hidden text dropped), and its attachments with the `part` to pass to mail_get_attachment. `truncated` means the body was cut. Does not mark the message read.",
 			inputSchema: z.object({
 				mailbox: mailboxArg,
 				uid: uidArg,

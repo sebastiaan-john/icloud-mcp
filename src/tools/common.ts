@@ -17,14 +17,14 @@ export const mailboxArg = z
 		"Mailbox name as mail_list_mailboxes returns it; defaults to INBOX",
 	);
 
-export const uidArg = z
-	.number()
-	.int()
-	.positive()
-	.describe("Message UID from mail_search, valid within its mailbox");
+const uid = z.number().int().min(1).max(4_294_967_295);
+
+export const uidArg = uid.describe(
+	"Message UID from mail_search, valid within its mailbox",
+);
 
 export const uidsArg = z
-	.array(z.number().int().positive())
+	.array(uid)
 	.min(1)
 	.max(100)
 	.describe("Message UIDs from mail_search, all in the same mailbox (1-100)");
@@ -34,7 +34,7 @@ export const READ_ONLY: ToolAnnotations = {
 	openWorldHint: true,
 };
 
-/** A write that can be repeated without changing the outcome, such as marking a message read. */
+/** A write that can be repeated without changing the outcome. */
 export const IDEMPOTENT_WRITE: ToolAnnotations = {
 	readOnlyHint: false,
 	destructiveHint: false,

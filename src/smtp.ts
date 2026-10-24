@@ -1,24 +1,28 @@
-import { connect as netConnect, type Socket } from "node:net";
-import { connect as tlsConnect, type TLSSocket } from "node:tls";
+import { isIP, connect as netConnect, type Socket } from "node:net";
+import { connect as tlsConnect } from "node:tls";
+import type { Config } from "./config";
+import { errorMessage } from "./errors";
 
-export interface SmtpConfig {
-	host: string;
-	/** 465 means TLS from the first byte; any other port upgrades with STARTTLS. */
-	port: number;
-	user: string;
-	password: string;
-}
+export type SmtpConfig = Config["smtp"];
 
+const TIMEOUT_MS = 60_000;
+
+/** The server refused the message or the connection failed before the body was sent. */
 export class SmtpError extends Error {
-	constructor(
-		message: string,
-		/** The server's reply code when it rejected a command; absent when the connection failed. */
-		readonly code?: number,
-		/** True when the body was handed over but no answer came back, so it may have been sent. */
-		readonly maybeSent = false,
-	) {
+	constructor(message: string) {
 		super(message);
 		this.name = "SmtpError";
+	}
+}
+
+/** The body was handed over but no answer came back, so it may have been delivered. */
+export class MaybeSentError extends Error {
+	constructor(cause: unknown) {
+		super(
+			`${errorMessage(cause)}. The message may have been sent anyway; check the Sent mailbox before sending it again.`,
+			{ cause },
+		);
+		this.name = "MaybeSentError";
 	}
 }
 
@@ -27,30 +31,42 @@ interface Reply {
 	text: string;
 }
 
-/** Collects SMTP reply lines (`250-...` continued, `250 ...` final) from a socket. */
+/** Collects SMTP reply lines (`250-...` continued, `250 ...` final) from one socket. */
 class ReplyReader {
 	private buffer = "";
 	private replies: Reply[] = [];
 	private lines: string[] = [];
 	private waiter?: { resolve(reply: Reply): void; reject(error: Error): void };
 	private failure?: Error;
+	private readonly onChunk = (chunk: Buffer) =>
+		this.onData(chunk.toString("utf8"));
+	private readonly onError = (error: Error) => this.fail(error);
+	private readonly onClose = () =>
+		this.fail(new SmtpError("SMTP connection closed"));
+	private readonly onTimeout = () => {
+		this.fail(new SmtpError("SMTP server timed out"));
+		this.socket.destroy();
+	};
 
-	attach(socket: Socket | TLSSocket): void {
-		socket.on("data", (chunk: Buffer) => this.onData(chunk.toString("utf8")));
-		socket.on("error", (error) => this.fail(error));
-		socket.on("close", () =>
-			this.fail(new SmtpError("SMTP connection closed")),
-		);
-		socket.on("timeout", () => {
-			this.fail(new SmtpError("SMTP server timed out"));
-			socket.destroy();
-		});
+	constructor(private readonly socket: Socket) {
+		socket.on("data", this.onChunk);
+		socket.on("error", this.onError);
+		socket.on("close", this.onClose);
+		socket.on("timeout", this.onTimeout);
 	}
 
-	detach(socket: Socket): void {
-		socket.removeAllListeners("data");
-		socket.removeAllListeners("close");
-		socket.removeAllListeners("timeout");
+	/** True when the server sent bytes nobody has read yet. */
+	get unread(): boolean {
+		return (
+			this.buffer !== "" || this.lines.length > 0 || this.replies.length > 0
+		);
+	}
+
+	detach(): void {
+		this.socket.off("data", this.onChunk);
+		this.socket.off("error", this.onError);
+		this.socket.off("close", this.onClose);
+		this.socket.off("timeout", this.onTimeout);
 	}
 
 	next(): Promise<Reply> {
@@ -89,18 +105,29 @@ class ReplyReader {
 	}
 }
 
-function once(
+/** Waits for a connect event; a close or timeout first is a failure, not a hang. */
+function connected(
 	socket: Socket,
 	event: "connect" | "secureConnect",
 ): Promise<void> {
 	return new Promise((resolve, reject) => {
 		socket.once(event, () => resolve());
 		socket.once("error", reject);
+		socket.once("close", () => reject(new SmtpError("SMTP connection closed")));
+		socket.once("timeout", () => {
+			reject(new SmtpError("SMTP server timed out"));
+			socket.destroy();
+		});
 	});
 }
 
+function servername(host: string): string | undefined {
+	// SNI takes a hostname; Bun refuses an IP address there.
+	return isIP(host) ? undefined : host;
+}
+
 /** Escapes lines that start with a dot and ends the body with CRLF.CRLF. */
-function dotStuff(raw: Uint8Array): Uint8Array {
+export function dotStuff(raw: Uint8Array): Uint8Array {
 	const text = Buffer.from(raw).toString("latin1").replace(/\r?\n/g, "\r\n");
 	const body = text.replace(/^\./gm, "..");
 	const ending = body.endsWith("\r\n") ? "" : "\r\n";
@@ -108,85 +135,85 @@ function dotStuff(raw: Uint8Array): Uint8Array {
 }
 
 /**
- * Sends one message with AUTH PLAIN over TLS and closes the connection. A
- * failure before DATA means nothing was sent; one after it sets `maybeSent`.
+ * Sends one message with AUTH PLAIN over TLS and closes the connection.
+ * Throws SmtpError when nothing was sent, including a rejection of the body,
+ * and MaybeSentError when the reply to the body never arrived.
  */
 export async function sendMail(
 	config: SmtpConfig,
 	from: string,
 	recipients: string[],
 	raw: Uint8Array,
-	timeoutMs = 60_000,
 ): Promise<void> {
-	const reader = new ReplyReader();
-	const implicitTls = config.port === 465;
+	const { host, port } = config;
+	const implicitTls = port === 465;
 	let socket: Socket = implicitTls
-		? tlsConnect({
-				host: config.host,
-				port: config.port,
-				servername: config.host,
-			})
-		: netConnect({ host: config.host, port: config.port });
-	socket.setTimeout(timeoutMs);
-	reader.attach(socket);
-	await once(socket, implicitTls ? "secureConnect" : "connect");
+		? tlsConnect({ host, port, servername: servername(host) })
+		: netConnect({ host, port });
+	socket.setTimeout(TIMEOUT_MS);
+	let reader = new ReplyReader(socket);
 
-	let stage = "greeting";
-	const expect = async (codes: number[]) => {
+	const expect = async (stage: string, codes: number[]) => {
 		const reply = await reader.next();
 		if (!codes.includes(reply.code)) {
 			throw new SmtpError(
 				`SMTP ${stage} rejected: ${reply.code} ${reply.text.replace(/\n/g, " ")}`,
-				reply.code,
 			);
 		}
 		return reply;
 	};
-	const command = async (line: string, codes: number[], name = line) => {
-		stage = name;
+	/** `stage` names the step in errors, so the AUTH line never appears in one. */
+	const command = (stage: string, line: string, codes: number[]) => {
 		socket.write(`${line}\r\n`);
-		return expect(codes);
+		return expect(stage, codes);
 	};
 
 	try {
-		await expect([220]);
-		const ehlo = await command("EHLO [127.0.0.1]", [250], "EHLO");
+		await connected(socket, implicitTls ? "secureConnect" : "connect");
+		await expect("greeting", [220]);
+		const ehlo = await command("EHLO", "EHLO [127.0.0.1]", [250]);
 		if (!implicitTls) {
 			if (!/^STARTTLS\b/im.test(ehlo.text)) {
 				throw new SmtpError(
 					"SMTP server does not offer STARTTLS; refusing to send in clear text",
 				);
 			}
-			await command("STARTTLS", [220]);
-			reader.detach(socket);
-			const secure = tlsConnect({ socket, servername: config.host });
-			secure.setTimeout(timeoutMs);
-			reader.attach(secure);
-			await once(secure, "secureConnect");
+			await command("STARTTLS", "STARTTLS", [220]);
+			// Anything already buffered arrived unencrypted and could be forged
+			// replies for the commands sent over TLS (RFC 3207 section 4.2).
+			if (reader.unread) {
+				throw new SmtpError("SMTP server sent data before the TLS handshake");
+			}
+			reader.detach();
+			const secure = tlsConnect({ socket, servername: servername(host) });
+			secure.setTimeout(TIMEOUT_MS);
+			reader = new ReplyReader(secure);
+			await connected(secure, "secureConnect");
 			socket = secure;
-			await command("EHLO [127.0.0.1]", [250], "EHLO");
+			await command("EHLO", "EHLO [127.0.0.1]", [250]);
 		}
 		const credentials = Buffer.from(
 			`\0${config.user}\0${config.password}`,
 		).toString("base64");
-		await command(`AUTH PLAIN ${credentials}`, [235], "AUTH");
-		await command(`MAIL FROM:<${from}>`, [250], "MAIL FROM");
+		await command("AUTH", `AUTH PLAIN ${credentials}`, [235]);
+		await command("MAIL FROM", `MAIL FROM:<${from}>`, [250]);
 		for (const recipient of recipients) {
 			await command(
+				`RCPT TO ${recipient}`,
 				`RCPT TO:<${recipient}>`,
 				[250, 251],
-				`RCPT TO ${recipient}`,
 			);
 		}
-		await command("DATA", [354]);
-		stage = "message";
+		await command("DATA", "DATA", [354]);
 		socket.write(dotStuff(raw));
-		await expect([250]).catch((error: unknown) => {
-			// A rejection after the body is a clear no; a lost reply is not.
-			if (error instanceof SmtpError && error.code !== undefined) throw error;
-			const message = error instanceof Error ? error.message : String(error);
-			throw new SmtpError(message, undefined, true);
+		const reply = await reader.next().catch((error: unknown) => {
+			throw new MaybeSentError(error);
 		});
+		if (reply.code !== 250) {
+			throw new SmtpError(
+				`SMTP message rejected: ${reply.code} ${reply.text.replace(/\n/g, " ")}`,
+			);
+		}
 		socket.write("QUIT\r\n");
 		socket.end();
 	} catch (error) {

@@ -2,9 +2,10 @@ import { describe, expect, it } from "bun:test";
 import {
 	decodeMailbox,
 	encodeMailbox,
-	fetchItems,
-	mailboxArg,
+	internalDate,
+	pairs,
 	parseResponse,
+	quoteMailbox,
 	ResponseFramer,
 	str,
 } from "./wire";
@@ -26,6 +27,18 @@ describe("ResponseFramer", () => {
 		]);
 	});
 
+	it("never reads a literal into status text that ends in {n}", () => {
+		const framer = new ResponseFramer();
+		const frames = framer.push(
+			bytes("A1 NO quota exceeded {3}\r\nA2 OK fine\r\n+ send {5}\r\n"),
+		);
+		expect(frames.map(decode)).toEqual([
+			"A1 NO quota exceeded {3}\r\n",
+			"A2 OK fine\r\n",
+			"+ send {5}\r\n",
+		]);
+	});
+
 	it("handles a literal far larger than its buffer", () => {
 		const big = "x".repeat(300_000);
 		const framer = new ResponseFramer();
@@ -38,7 +51,7 @@ describe("ResponseFramer", () => {
 		const response = parseResponse(frames[0]!);
 		expect(response.kind).toBe("data");
 		if (response.kind !== "data") return;
-		const body = fetchItems(response.values).get("BODY[1]");
+		const body = pairs(response.values[0]).get("BODY[1]");
 		expect(body).toBeInstanceOf(Uint8Array);
 		expect((body as Uint8Array).length).toBe(big.length);
 	});
@@ -65,8 +78,7 @@ describe("parseResponse", () => {
 		);
 		if (response.kind !== "data") throw new Error("expected data");
 		expect(response.type).toBe("FETCH");
-		expect(response.number).toBe(3);
-		const items = fetchItems(response.values);
+		const items = pairs(response.values[0]);
 		expect(items.get("UID")).toBe("12");
 		expect(items.get("FLAGS")).toEqual(["\\Seen", "$Junk"]);
 		expect(
@@ -75,11 +87,32 @@ describe("parseResponse", () => {
 		expect(items.get("ENVELOPE")).toEqual([null, 'Hi "you"']);
 	});
 
+	it("treats a bracket in a keyword as text", () => {
+		const response = parseResponse(
+			bytes("* 1 FETCH (UID 1 FLAGS ([project] a[b \\Seen))\r\n"),
+		);
+		if (response.kind !== "data") throw new Error("expected data");
+		expect(pairs(response.values[0]).get("FLAGS")).toEqual([
+			"[project]",
+			"a[b",
+			"\\Seen",
+		]);
+	});
+
 	it("parses continuation requests", () => {
 		expect(parseResponse(bytes("+ Ready for literal data\r\n"))).toEqual({
 			kind: "continuation",
 			text: "Ready for literal data",
 		});
+	});
+});
+
+describe("internalDate", () => {
+	it("keeps the offset and pads a one-digit day", () => {
+		expect(internalDate(" 4-Oct-2026 09:15:00 +0200")).toBe(
+			"2026-10-04T09:15:00+02:00",
+		);
+		expect(internalDate("4-Foo-2026 09:15:00 +0200")).toBeUndefined();
 	});
 });
 
@@ -95,6 +128,6 @@ describe("arguments", () => {
 		for (const name of ["Projecten/Café", "R&D", "日本語", "Ünï & 😀"]) {
 			expect(decodeMailbox(encodeMailbox(name))).toBe(name);
 		}
-		expect(mailboxArg("Sent Messages")).toBe('"Sent Messages"');
+		expect(quoteMailbox("Sent Messages")).toBe('"Sent Messages"');
 	});
 });

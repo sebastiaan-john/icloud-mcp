@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import type { DraftInput, Mail } from "../mail";
 import { parseAddress } from "../mime/compose";
-import { json } from "./common";
+import { json, mailboxArg, uidArg } from "./common";
 
 const addresses = (description: string) =>
 	z
@@ -30,23 +30,22 @@ const draftSchema = z
 				"Subject line. For a reply, leave empty to use Re: and the original subject",
 			),
 		body: z.string().describe("Plain-text body"),
-		reply_to_uid: z
-			.number()
-			.int()
-			.positive()
+		reply_to_uid: uidArg
 			.optional()
 			.describe(
 				"UID of the message this answers, for threading and default recipients",
 			),
-		reply_mailbox: z
-			.string()
-			.min(1)
-			.default("INBOX")
-			.describe("Mailbox of reply_to_uid; defaults to INBOX"),
+		reply_mailbox: mailboxArg.describe(
+			"Mailbox of reply_to_uid; defaults to INBOX",
+		),
 		reply_all: z
 			.boolean()
 			.default(false)
 			.describe("With reply_to_uid, also copy everyone on the original"),
+	})
+	.refine((a) => a.reply_to_uid !== undefined || !a.reply_all, {
+		message: "reply_all needs reply_to_uid",
+		path: ["reply_all"],
 	})
 	.refine((a) => a.reply_to_uid !== undefined || a.subject !== undefined, {
 		message: "A new message needs a subject",

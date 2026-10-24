@@ -1,110 +1,33 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { connect, createServer, type Server, type Socket } from "node:net";
 import { ImapCommandError, ImapConnectionError } from "./connection";
-import { ImapSession } from "./session";
-
-type Reply = (socket: Socket, tag: string, literal?: string) => void;
-
-/**
- * A scripted IMAP server over plain TCP. It answers synchronizing literals
- * with `+`, unless `refuseLiteral` says to answer NO instead.
- */
-async function fakeImap(
-	handle: (command: string) => Reply | undefined,
-	refuseLiteral = false,
-) {
-	const stats = { connections: 0, logins: 0 };
-	const sockets = new Set<Socket>();
-	const server: Server = createServer((socket) => {
-		stats.connections++;
-		sockets.add(socket);
-		socket.on("close", () => sockets.delete(socket));
-		socket.write("* OK [CAPABILITY IMAP4rev1 MOVE] ready\r\n");
-		let buffer = Buffer.alloc(0);
-		let pending: { tag: string; command: string; size: number } | undefined;
-		socket.on("data", (chunk: Buffer) => {
-			buffer = Buffer.concat([buffer, chunk]);
-			for (;;) {
-				if (pending) {
-					if (buffer.length < pending.size + 2) return;
-					const literal = buffer.subarray(0, pending.size).toString();
-					buffer = buffer.subarray(pending.size + 2);
-					const { tag, command } = pending;
-					pending = undefined;
-					handle(command)?.(socket, tag, literal);
-					continue;
-				}
-				const lf = buffer.indexOf("\n");
-				if (lf === -1) return;
-				const line = buffer.subarray(0, lf).toString().replace(/\r$/, "");
-				buffer = buffer.subarray(lf + 1);
-				const [tag = "", ...rest] = line.split(" ");
-				const command = rest.join(" ");
-				const literal = /\{(\d+)\}$/.exec(command);
-				if (literal) {
-					if (refuseLiteral) {
-						socket.write(`${tag} NO [OVERQUOTA] too big\r\n`);
-						continue;
-					}
-					pending = { tag, command, size: Number(literal[1]) };
-					socket.write("+ go\r\n");
-					continue;
-				}
-				if (command.startsWith("LOGIN")) stats.logins++;
-				const reply =
-					handle(command) ?? ((s, t) => s.write(`${t} OK done\r\n`));
-				reply(socket, tag);
-			}
-		});
-	});
-	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-	const { port } = server.address() as { port: number };
-	return {
-		stats,
-		session: (idleMs = 60_000) =>
-			new ImapSession(
-				{ host: "127.0.0.1", port, user: "me", password: "s3cr3t-pw" },
-				() => connect(port, "127.0.0.1"),
-				idleMs,
-			),
-		/** Drops every socket without a word, like a NAT box forgetting the connection. */
-		dropAll: () => {
-			for (const socket of sockets) socket.destroy();
-		},
-		close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-	};
-}
+import { fakeImap } from "./fake-server";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 
+async function setup(...args: Parameters<typeof fakeImap>) {
+	const server = await fakeImap(...args);
+	const session = server.session();
+	cleanups.push(() => session.close(), server.close);
+	return { server, session };
+}
+
 describe("ImapSession", () => {
 	it("logs in once, reuses the connection, and sends literals after the server's +", async () => {
-		let appended = "";
-		const server = await fakeImap((command) => {
-			if (command.startsWith("APPEND")) {
-				return (socket, tag, literal) => {
-					appended = literal ?? "";
-					socket.write(`${tag} OK [APPENDUID 1 5] saved\r\n`);
-				};
-			}
-			if (command.startsWith("UID SEARCH")) {
-				return (socket, tag) =>
-					socket.write(`* SEARCH 3 9\r\n${tag} OK done\r\n`);
-			}
-			return undefined;
-		});
-		const session = server.session();
-		cleanups.push(() => session.close(), server.close);
-
+		const { server, session } = await setup((command) =>
+			command.startsWith("UID SEARCH")
+				? { untagged: "* SEARCH 3 9\r\n" }
+				: command.startsWith("APPEND")
+					? { status: "OK [APPENDUID 1 5] saved" }
+					: undefined,
+		);
 		const uids = await session.run(async (client) => {
 			expect(client.capabilities.has("MOVE")).toBe(true);
-			const { data } = await client.exec(["UID SEARCH ALL"]);
-			return data[0]?.values;
+			return client.uidSearch(["ALL"]);
 		});
-		expect(uids).toEqual(["3", "9"]);
+		expect(uids).toEqual([3, 9]);
 		const status = await session.run((client) =>
 			client.exec([
 				"APPEND",
@@ -113,15 +36,14 @@ describe("ImapSession", () => {
 			]),
 		);
 		expect(status.status.code).toBe("APPENDUID 1 5");
-		expect(appended).toBe("Subject: hi\r\n\r\nbody");
-		expect(server.stats).toEqual({ connections: 1, logins: 1 });
+		expect(server.literals).toEqual(["Subject: hi\r\n\r\nbody"]);
+		expect(server.stats).toMatchObject({ connections: 1, logins: 1 });
 	});
 
 	it("keeps the connection usable after the server refuses a literal", async () => {
-		const server = await fakeImap(() => undefined, true);
-		const session = server.session();
-		cleanups.push(() => session.close(), server.close);
-
+		const { server, session } = await setup(undefined, {
+			refuseLiterals: true,
+		});
 		const refused = session.run((client) =>
 			client.exec(["APPEND", '"Drafts"', { literal: new Uint8Array(10) }]),
 		);
@@ -132,59 +54,86 @@ describe("ImapSession", () => {
 	});
 
 	it("retries a read once on a fresh connection when the reused one is dead", async () => {
-		let silent = false;
-		const server = await fakeImap((command) =>
-			command === "NOOP" && silent ? (socket) => socket.destroy() : undefined,
+		let drop = false;
+		const { server, session } = await setup((command) =>
+			command === "NOOP" && drop ? "drop" : undefined,
 		);
-		const session = server.session();
-		cleanups.push(() => session.close(), server.close);
-
 		await session.run((client) => client.exec(["NOOP"]));
-		silent = true;
-		// The first attempt dies mid-command; the retry runs on a new connection.
+		drop = true;
 		let attempts = 0;
 		const result = await session.run((client) => {
 			attempts++;
-			if (attempts === 2) silent = false;
+			if (attempts === 2) drop = false;
 			return client.exec(["NOOP"]);
 		});
 		expect(result.status.status).toBe("OK");
 		expect(attempts).toBe(2);
 		expect(server.stats.logins).toBe(2);
-
-		silent = true;
-		const write = session.run((client) => client.exec(["NOOP"]), {
-			retry: false,
-		});
-		await expect(write).rejects.toBeInstanceOf(ImapConnectionError);
 	});
 
-	it("reconnects after the server drops an idle connection", async () => {
-		const server = await fakeImap(() => undefined);
-		const session = server.session();
-		cleanups.push(() => session.close(), server.close);
-
+	it("runs a write once: a dead reused connection is replaced first, a failure mid-write is not retried", async () => {
+		let dropAppend = false;
+		const { server, session } = await setup((command) =>
+			command.startsWith("APPEND") && dropAppend ? "drop" : undefined,
+		);
 		await session.run((client) => client.exec(["NOOP"]));
 		server.dropAll();
-		await session.run((client) => client.exec(["NOOP"]));
+		let attempts = 0;
+		const append = (
+			client: Parameters<Parameters<typeof session.run>[0]>[0],
+		) => {
+			attempts++;
+			return client.exec([
+				"APPEND",
+				'"Drafts"',
+				{ literal: new Uint8Array(3) },
+			]);
+		};
+		await session.run(append, { retry: false });
+		expect(attempts).toBe(1);
 		expect(server.stats.logins).toBe(2);
+
+		dropAppend = true;
+		await expect(session.run(append, { retry: false })).rejects.toBeInstanceOf(
+			ImapConnectionError,
+		);
+		expect(attempts).toBe(2);
+		expect(server.literals).toHaveLength(2);
+	});
+
+	it("runs calls one at a time on one connection", async () => {
+		const { server, session } = await setup();
+		const order: string[] = [];
+		const call = (name: string) =>
+			session.run(async (client) => {
+				order.push(`${name}1`);
+				await client.exec(["NOOP"]);
+				order.push(`${name}2`);
+			});
+		await Promise.all([call("a"), call("b")]);
+		expect(order).toEqual(["a1", "a2", "b1", "b2"]);
+		expect(server.stats.connections).toBe(1);
+	});
+
+	it("logs out after the idle time and reconnects on the next call", async () => {
+		const server = await fakeImap();
+		const session = server.session(1);
+		cleanups.push(() => session.close(), server.close);
+		const loggedOut = server.nextLogout();
+		await session.run((client) => client.exec(["NOOP"]));
+		await loggedOut;
+		await session.run((client) => client.exec(["NOOP"]));
+		expect(server.stats).toMatchObject({ connections: 2, logouts: 1 });
 	});
 
 	it("explains a rejected login without echoing the password", async () => {
-		const server = await fakeImap((command) =>
-			command.startsWith("LOGIN")
-				? (socket, tag) =>
-						socket.write(
-							`${tag} NO [AUTHENTICATIONFAILED] Authentication failed.\r\n`,
-						)
-				: undefined,
-		);
-		const session = server.session();
-		cleanups.push(() => session.close(), server.close);
-
+		const { session } = await setup(undefined, {
+			loginStatus: "NO [AUTHENTICATIONFAILED] bad password s3cr3t-pw",
+		});
 		const error = await session.run(async () => {}).catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toContain("app-specific password");
-		expect((error as Error).message).not.toContain("s3cr3t-pw");
+		const message = error instanceof Error ? error.message : "";
+		expect(message).toContain("app-specific password");
+		expect(message).not.toContain("s3cr3t-pw");
 	});
 });
