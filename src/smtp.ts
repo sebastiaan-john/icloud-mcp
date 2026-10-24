@@ -136,8 +136,9 @@ export function dotStuff(raw: Uint8Array): Uint8Array {
 
 /**
  * Sends one message with AUTH PLAIN over TLS and closes the connection.
- * Throws SmtpError when nothing was sent, including a rejection of the body,
- * and MaybeSentError when the reply to the body never arrived.
+ * Throws MaybeSentError when the reply to the body never arrived; any other
+ * failure (a refusal, a closed or timed-out connection, a socket error) means
+ * nothing was sent.
  */
 export async function sendMail(
 	config: SmtpConfig,
@@ -153,7 +154,7 @@ export async function sendMail(
 	socket.setTimeout(TIMEOUT_MS);
 	let reader = new ReplyReader(socket);
 
-	const expect = async (stage: string, codes: number[]) => {
+	const expectReply = async (stage: string, codes: number[]) => {
 		const reply = await reader.next();
 		if (!codes.includes(reply.code)) {
 			throw new SmtpError(
@@ -165,12 +166,12 @@ export async function sendMail(
 	/** `stage` names the step in errors, so the AUTH line never appears in one. */
 	const command = (stage: string, line: string, codes: number[]) => {
 		socket.write(`${line}\r\n`);
-		return expect(stage, codes);
+		return expectReply(stage, codes);
 	};
 
 	try {
 		await connected(socket, implicitTls ? "secureConnect" : "connect");
-		await expect("greeting", [220]);
+		await expectReply("greeting", [220]);
 		const ehlo = await command("EHLO", "EHLO [127.0.0.1]", [250]);
 		if (!implicitTls) {
 			if (!/^STARTTLS\b/im.test(ehlo.text)) {

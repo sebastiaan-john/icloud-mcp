@@ -111,6 +111,17 @@ describe("ImapMail replies", () => {
 		expect(own.delivered[0]?.rcpt).toEqual(["jan@example.nl"]);
 	});
 
+	it("keeps the thread root from glued or commented References", async () => {
+		const { mail, delivered } = await setup(
+			mailbox(
+				envelope('(("Me" NIL "me" "icloud.com"))'),
+				"<root@x>(first)<mid@x>",
+			),
+		);
+		await mail.send(reply(false));
+		expect(delivered[0]?.raw).toContain("References: <root@x> <mid@x> <o@x>");
+	});
+
 	it("drops a Message-ID that is not one and falls back to In-Reply-To for threading", async () => {
 		const original =
 			'("d" "Hi" (("Jan" NIL "jan" "example.nl")) NIL NIL NIL NIL NIL "<root@x>" "<o@x>\rBcc: thief@evil.example")';
@@ -218,6 +229,57 @@ describe("ImapMail reads and moves", () => {
 		expect(message).toMatchObject({ text: "hel", truncated: true });
 		expect(server.commands[0]).toBe('EXAMINE "INBOX"');
 		expect(server.commands.filter((c) => /BODY\[/.test(c))).toEqual([]);
+	});
+
+	it("names special mailboxes by flag, then by their usual name", async () => {
+		const { mail } = await setup((command) => {
+			if (command.startsWith("LIST")) {
+				return {
+					untagged: [
+						'* LIST () "/" "INBOX"\r\n',
+						'* LIST (\\Trash) "/" "Bin"\r\n',
+						'* LIST () "/" "Deleted Messages"\r\n',
+						'* LIST () "/" "Sent Messages"\r\n',
+						'* LIST (\\Noselect) "/" "Folders"\r\n',
+					].join(""),
+				};
+			}
+			if (command.startsWith("STATUS")) {
+				const name = /"([^"]+)"/.exec(command)?.[1] ?? "";
+				return { untagged: `* STATUS "${name}" (MESSAGES 2 UNSEEN 1)\r\n` };
+			}
+			return undefined;
+		});
+		expect(await mail.listMailboxes()).toEqual([
+			{ name: "INBOX", special_use: "inbox", messages: 2, unread: 1 },
+			{ name: "Bin", special_use: "trash", messages: 2, unread: 1 },
+			{ name: "Deleted Messages", messages: 2, unread: 1 },
+			{ name: "Sent Messages", special_use: "sent", messages: 2, unread: 1 },
+		]);
+	});
+
+	it("fetches text within one budget and marks a partial body truncated", async () => {
+		const big =
+			'("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 3000000 1 NIL NIL NIL NIL)';
+		const { server, mail } = await setup((command) => {
+			if (command.includes("BODYSTRUCTURE")) {
+				return {
+					untagged: `* 7 FETCH (UID 7 FLAGS () ENVELOPE ${envelope("NIL")} BODYSTRUCTURE (${PLAIN}${big} "mixed" NIL NIL NIL NIL))\r\n`,
+				};
+			}
+			if (command.includes("BODY.PEEK[1]")) {
+				return {
+					untagged:
+						"* 7 FETCH (UID 7 BODY[1] {5}\r\nhello BODY[2]<0> {3}\r\nbye)\r\n",
+				};
+			}
+			return undefined;
+		});
+		const message = await mail.read("INBOX", 7, 1000);
+		expect(message).toMatchObject({ text: "hello\n\nbye", truncated: true });
+		expect(server.commands).toContain(
+			`UID FETCH 7 (UID BODY.PEEK[1] BODY.PEEK[2]<0.${2 * 1024 * 1024 - 5}>)`,
+		);
 	});
 
 	it("moves once with the COPY fallback and names a missing destination", async () => {

@@ -21,12 +21,12 @@ export interface Composed {
 }
 
 /**
- * `user@host` in printable ASCII without spaces, angle brackets, or a second
- * `@`. Addresses outside ASCII would need SMTPUTF8, which this sender does
- * not negotiate, so they are refused here.
+ * `user@host` with a dot-atom local part and a plain domain. Quoted local
+ * parts, address literals, and non-ASCII addresses (which need SMTPUTF8,
+ * not negotiated here) are refused rather than sent ambiguously.
  */
 const ADDR_SPEC =
-	/^[\x21-\x3b\x3d\x3f\x41-\x7e]+@[\x21-\x3b\x3d\x3f\x41-\x7e]+$/;
+	/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 
 /** Splits `Name <user@host>` into its parts; undefined when it is not an address. */
 export function parseAddress(
@@ -42,6 +42,8 @@ export function parseAddress(
 	if (
 		open === -1 ||
 		!ADDR_SPEC.test(address) ||
+		// A name holding `<` or `>` is a second address squeezed into one entry.
+		/[<>]/.test(rawName) ||
 		// oxlint-disable-next-line no-control-regex -- a display name must not break a header line
 		/[\x00-\x1f\x7f]/.test(rawName)
 	) {
@@ -178,15 +180,15 @@ function fold(line: string): string {
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
+const DAYS = "Sun Mon Tue Wed Thu Fri Sat".split(" ");
+const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 
 /** `Sat, 24 Oct 2026 23:05:09 +0200`, in the local time zone. */
 function formatDate(date: Date): string {
-	const days = "Sun Mon Tue Wed Thu Fri Sat".split(" ");
-	const months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 	const offset = -date.getTimezoneOffset();
 	const sign = offset >= 0 ? "+" : "-";
 	const zone = `${sign}${pad(Math.floor(Math.abs(offset) / 60))}${pad(Math.abs(offset) % 60)}`;
-	return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${zone}`;
+	return `${DAYS[date.getDay()]}, ${date.getDate()} ${MONTHS[date.getMonth()]} ${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${zone}`;
 }
 
 /** Quoted-printable over UTF-8, with soft breaks at 76 characters and CRLF line ends. */

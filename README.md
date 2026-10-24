@@ -82,7 +82,7 @@ Messages are addressed by mailbox name plus UID. `mail_search` returns UIDs; a U
 |---|---|
 | `mail_list_mailboxes` | Mailboxes with message and unread counts, and which is inbox, sent, drafts, trash, junk, or archive |
 | `mail_search` | Newest-first search in one mailbox by text, sender, recipient, subject, date range, read and flagged state, with paging |
-| `mail_read` | One message: headers, the body as text (HTML converted, links kept, hidden text dropped), and its attachments. Does not mark it read |
+| `mail_read` | One message: headers, the body as text (HTML converted, links kept), and its attachments. Does not mark it read |
 | `mail_get_attachment` | One attachment up to 10 MB: images as images, text as text, anything else as a base64 resource |
 | `mail_update_flags` | Mark read or unread, flag or unflag |
 | `mail_move` | Move to another mailbox; deleting is a move to the trash mailbox |
@@ -91,7 +91,7 @@ Messages are addressed by mailbox name plus UID. `mail_search` returns UIDs; a U
 
 Replies take `reply_to_uid`: the server fills in `In-Reply-To`, `References`, the `Re:` subject, and the recipients (`reply_all` copies everyone else on the original, up to 50 people in total), and marks the original answered after sending. Addresses must be ASCII; the server does not use SMTPUTF8.
 
-Email comes from strangers, and an assistant reading it can be steered by what it says. The server instructions tell the model to treat message content as data, `mail_read` drops text hidden with CSS, and `mail_send` is the one tool that acts outside the mailbox. For an unattended bot, leave `mail_send` out of `allowed_tools` so it can only draft.
+Email comes from strangers, and an assistant reading it can be steered by what it says, including text the sender hid from human readers. The server instructions tell the model to treat message content as data, which helps but is no guarantee. `mail_send` is the one tool that acts outside the mailbox, which is why the Grok example above leaves it out.
 
 Sending cannot be undone, and the tool description tells the model to confirm with you first. If the SMTP connection drops after the message was handed over, the error says it may have been sent and to check Sent before retrying. iCloud may or may not file SMTP mail in Sent by itself, so after sending the server looks for the Message-ID in Sent and appends a copy, Bcc included, only when it is missing.
 

@@ -15,7 +15,7 @@ export function registerOrganizeTools(server: McpServer, mail: Mail) {
 		{
 			title: "Mark read, unread, or flagged",
 			description:
-				"Marks messages read or unread and flags or unflags them. Returns the UIDs it changed and any that no longer exist.",
+				"Marks messages read or unread and flags or unflags them. Returns `updated`, the UIDs that exist in the mailbox, and `not_found` for any that do not.",
 			inputSchema: z
 				.object({
 					mailbox: mailboxArg,

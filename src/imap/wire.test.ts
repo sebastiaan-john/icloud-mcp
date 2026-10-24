@@ -39,6 +39,17 @@ describe("ResponseFramer", () => {
 		]);
 	});
 
+	it("does not take literal bytes ending in {n} for another literal", () => {
+		const framer = new ResponseFramer();
+		const frames = framer.push(
+			bytes('* LIST () "/" {5}\r\nab{3}\r\nA1 OK done\r\n'),
+		);
+		expect(frames.map(decode)).toEqual([
+			'* LIST () "/" {5}\r\nab{3}\r\n',
+			"A1 OK done\r\n",
+		]);
+	});
+
 	it("handles a literal far larger than its buffer", () => {
 		const big = "x".repeat(300_000);
 		const framer = new ResponseFramer();

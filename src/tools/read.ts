@@ -69,7 +69,7 @@ export function registerReadTools(server: McpServer, mail: Mail) {
 		{
 			title: "List mailboxes",
 			description:
-				"Every mailbox with its message and unread counts. `special_use` marks inbox, sent, drafts, trash, junk, and archive; on iCloud those are named, for example, `Sent Messages` and `Deleted Messages`.",
+				"Lists every mailbox with its message and unread counts. `special_use` marks inbox, sent, drafts, trash, junk, and archive; on iCloud those are named, for example, `Sent Messages` and `Deleted Messages`.",
 			annotations: READ_ONLY,
 		},
 		async () => json({ mailboxes: await mail.listMailboxes() }),
@@ -142,7 +142,7 @@ export function registerReadTools(server: McpServer, mail: Mail) {
 		{
 			title: "Read message",
 			description:
-				"One message: headers, the body as plain text (HTML is converted, links kept as `text (url)`, hidden text dropped), and its attachments with the `part` to pass to mail_get_attachment. `truncated` means the body was cut. Does not mark the message read.",
+				"Returns one message: headers, the body as plain text (HTML is converted, links kept as `text (url)`), and its attachments with the `part` to pass to mail_get_attachment. `truncated` means the body was cut. Does not mark the message read.",
 			inputSchema: z.object({
 				mailbox: mailboxArg,
 				uid: uidArg,

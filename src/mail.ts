@@ -42,13 +42,13 @@ export type SpecialUse =
 	| "junk"
 	| "archive";
 
-const SPECIAL_USE_FLAGS: Record<string, SpecialUse> = {
-	"\\SENT": "sent",
-	"\\DRAFTS": "drafts",
-	"\\TRASH": "trash",
-	"\\JUNK": "junk",
-	"\\ARCHIVE": "archive",
-};
+const SPECIAL_USE_FLAGS = new Map<string, SpecialUse>([
+	["\\SENT", "sent"],
+	["\\DRAFTS", "drafts"],
+	["\\TRASH", "trash"],
+	["\\JUNK", "junk"],
+	["\\ARCHIVE", "archive"],
+]);
 
 /** Names to fall back on when the server does not mark special-use mailboxes. */
 const SPECIAL_USE_NAMES = new Map<string, SpecialUse>([
@@ -166,7 +166,7 @@ export interface Mail {
 	}>;
 }
 
-/** Mail over one IMAP session plus SMTP for sending. */
+/** `Mail` over one IMAP session, with SMTP for sending. */
 export class ImapMail implements Mail {
 	constructor(
 		private readonly session: ImapSession,
@@ -346,15 +346,20 @@ export class ImapMail implements Mail {
 
 	async send(draft: DraftInput) {
 		const outgoing = await this.outgoing(draft);
-		const { raw, messageId, recipients } = compose(outgoing);
+		const date = new Date();
+		const { raw, messageId, recipients } = compose(outgoing, { date });
 		if (recipients.length === 0) {
 			throw new Error("Add at least one recipient in to, cc, or bcc.");
 		}
-		const from = bareAddress(this.config.from);
-		if (!from) throw new Error(`Not an email address: ${this.config.from}`);
+		// config.ts has already checked that `from` parses.
+		const from = bareAddress(this.config.from) ?? this.config.from;
 		await this.deliver(this.config.smtp, from, recipients, raw);
 		// The archived copy keeps Bcc, which the delivered one must not carry.
-		const archived = compose(outgoing, { includeBcc: true, messageId }).raw;
+		const archived = compose(outgoing, {
+			includeBcc: true,
+			date,
+			messageId,
+		}).raw;
 		const sentCopy = await this.session
 			.run(
 				async (client) => {
@@ -482,13 +487,13 @@ function threadReferences(
 	header: string,
 	envelope: { inReplyTo?: string; messageId?: string },
 ): string[] {
-	const ids = header
-		.replace(/^references:/i, "")
-		.split(/\s+/)
-		.filter((id) => MESSAGE_ID.test(id));
+	// Ids may be glued together or followed by comments, so pick out each <...>.
+	const ids = (header.match(/<[^<>\s]+>/g) ?? []).filter((id) =>
+		MESSAGE_ID.test(id),
+	);
 	if (ids.length === 0 && envelope.inReplyTo) ids.push(envelope.inReplyTo);
 	if (envelope.messageId) ids.push(envelope.messageId);
-	return ids.length > 20 ? [ids[0] ?? "", ...ids.slice(-19)] : ids;
+	return ids.length > 20 ? [...ids.slice(0, 1), ...ids.slice(-19)] : ids;
 }
 
 /**
@@ -658,22 +663,22 @@ async function listAll(client: ImapClient): Promise<ListedMailbox[]> {
 			const [flags, , rawName] = d.values;
 			const attributes = flagSet(flags);
 			const name = decodeMailbox(text(rawName) ?? "");
-			const marked: SpecialUse | undefined =
+			const flagged =
 				name.toUpperCase() === "INBOX"
 					? "inbox"
-					: [...attributes].map((a) => SPECIAL_USE_FLAGS[a]).find(Boolean);
+					: [...attributes].map((a) => SPECIAL_USE_FLAGS.get(a)).find(Boolean);
 			return {
 				name,
 				selectable:
 					!attributes.has("\\NOSELECT") && !attributes.has("\\NONEXISTENT"),
-				marked,
+				flagged,
 			};
 		});
-	const marked = new Set(listed.map((m) => m.marked));
-	return listed.map(({ name, selectable, marked: use }) => {
+	const claimed = new Set(listed.map((m) => m.flagged));
+	return listed.map(({ name, selectable, flagged }) => {
 		const byName = SPECIAL_USE_NAMES.get(name.toLowerCase());
 		const specialUse =
-			use ?? (byName && !marked.has(byName) ? byName : undefined);
+			flagged ?? (byName && !claimed.has(byName) ? byName : undefined);
 		return { name, selectable, specialUse };
 	});
 }

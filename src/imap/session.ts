@@ -220,7 +220,8 @@ export class ImapSession {
 	}
 
 	private enqueue<T>(task: () => Promise<T>): Promise<T> {
-		const result = this.tail.then(task, task);
+		// The tail never rejects, so the task always runs.
+		const result = this.tail.then(task);
 		this.tail = result.catch(() => {});
 		return result;
 	}

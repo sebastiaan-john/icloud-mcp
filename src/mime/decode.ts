@@ -88,7 +88,8 @@ export function decodeHeader(raw: string): string {
 		if (!adjacent || run?.charset !== charset) flush();
 		if (!adjacent) out += between;
 		run ??= { charset, bytes: [] };
-		run.bytes.push(...wordBytes(kind, payload));
+		// A loop, not push(...bytes): one huge word would overflow the stack.
+		for (const byte of wordBytes(kind, payload)) run.bytes.push(byte);
 		last = match.index + match[0].length;
 	}
 	flush();
@@ -108,7 +109,7 @@ function wordBytes(kind: string, payload: string): Uint8Array {
 
 /** `UTF-8*nl` (RFC 2231 language suffix) becomes `UTF-8`. */
 function stripLanguage(charset: string): string {
-	return charset.split("*")[0]!;
+	return charset.replace(/\*.*/s, "");
 }
 
 /**
@@ -165,66 +166,69 @@ function decode2231(pieces: Array<[string, boolean]>): string {
 	return decodeCharset(new Uint8Array(bytes), charset);
 }
 
-const ENTITIES: Record<string, string> = {
-	amp: "&",
-	lt: "<",
-	gt: ">",
-	quot: '"',
-	apos: "'",
-	nbsp: " ",
-	copy: "©",
-	reg: "®",
-	trade: "™",
-	hellip: "…",
-	mdash: "—",
-	ndash: "–",
-	lsquo: "‘",
-	rsquo: "’",
-	ldquo: "“",
-	rdquo: "”",
-	laquo: "«",
-	raquo: "»",
-	bull: "•",
-	middot: "·",
-	euro: "€",
-	pound: "£",
-	deg: "°",
-	times: "×",
-	shy: "",
-	zwnj: "",
-	zwj: "",
-	agrave: "à",
-	aacute: "á",
-	acirc: "â",
-	auml: "ä",
-	ccedil: "ç",
-	egrave: "è",
-	eacute: "é",
-	ecirc: "ê",
-	euml: "ë",
-	iacute: "í",
-	iuml: "ï",
-	ntilde: "ñ",
-	oacute: "ó",
-	ocirc: "ô",
-	ouml: "ö",
-	uacute: "ú",
-	uuml: "ü",
-	szlig: "ß",
-	AMP: "&",
-	LT: "<",
-	GT: ">",
-	QUOT: '"',
-	Aacute: "Á",
-	Agrave: "À",
-	Auml: "Ä",
-	Ccedil: "Ç",
-	Egrave: "È",
-	Ntilde: "Ñ",
-	Eacute: "É",
-	Ouml: "Ö",
-	Uuml: "Ü",
-};
+/** A Map, so a name like `constructor` cannot reach Object.prototype. */
+const ENTITIES = new Map<string, string>(
+	Object.entries({
+		amp: "&",
+		lt: "<",
+		gt: ">",
+		quot: '"',
+		apos: "'",
+		nbsp: " ",
+		copy: "©",
+		reg: "®",
+		trade: "™",
+		hellip: "…",
+		mdash: "—",
+		ndash: "–",
+		lsquo: "‘",
+		rsquo: "’",
+		ldquo: "“",
+		rdquo: "”",
+		laquo: "«",
+		raquo: "»",
+		bull: "•",
+		middot: "·",
+		euro: "€",
+		pound: "£",
+		deg: "°",
+		times: "×",
+		shy: "",
+		zwnj: "",
+		zwj: "",
+		agrave: "à",
+		aacute: "á",
+		acirc: "â",
+		auml: "ä",
+		ccedil: "ç",
+		egrave: "è",
+		eacute: "é",
+		ecirc: "ê",
+		euml: "ë",
+		iacute: "í",
+		iuml: "ï",
+		ntilde: "ñ",
+		oacute: "ó",
+		ocirc: "ô",
+		ouml: "ö",
+		uacute: "ú",
+		uuml: "ü",
+		szlig: "ß",
+		AMP: "&",
+		LT: "<",
+		GT: ">",
+		QUOT: '"',
+		Aacute: "Á",
+		Agrave: "À",
+		Auml: "Ä",
+		Ccedil: "Ç",
+		Egrave: "È",
+		Ntilde: "Ñ",
+		Eacute: "É",
+		Ouml: "Ö",
+		Uuml: "Ü",
+	}),
+);
 
 function decodeEntities(text: string): string {
 	return text.replace(
@@ -239,12 +243,12 @@ function decodeEntities(text: string): string {
 					? String.fromCodePoint(code)
 					: whole;
 			}
-			return ENTITIES[name] ?? whole;
+			return ENTITIES.get(name) ?? whole;
 		},
 	);
 }
 
-const SKIPPED = new Set(["head", "style", "script", "title", "template"]);
+const SKIPPED = new Set(["style", "script", "title", "template"]);
 const BLOCKS = new Set([
 	"p",
 	"div",
@@ -266,41 +270,32 @@ const BLOCKS = new Set([
 	"br",
 	"hr",
 ]);
-const VOID = new Set([
-	"br",
-	"hr",
-	"img",
-	"meta",
-	"link",
-	"input",
-	"wbr",
-	"col",
-	"area",
-	"base",
-	"source",
-]);
-const HIDDEN = /\bhidden\b|display\s*:\s*none|visibility\s*:\s*hidden/i;
 const HREF = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
 
 /**
  * Renders HTML mail as plain text for a model to read: block elements become
- * line breaks, links keep their target as `text (url)`, and head, style,
- * script, comments, and elements hidden with `hidden` or CSS are dropped.
- * Hidden text is where mailers put preheaders and senders put instructions
- * meant for an assistant rather than the reader.
+ * line breaks, links keep their target as `text (url)`, and style, script,
+ * title, and comments are dropped. Text hidden with CSS is kept; telling it
+ * apart takes a CSS engine, and the plain-text part a sender also controls
+ * is read as is anyway.
  *
  * One pass over the input with `indexOf`, so an unclosed tag or comment
- * costs linear time, not a rescan per tag.
+ * costs linear time.
  */
 export function htmlToText(html: string): string {
 	let out = "";
 	let i = 0;
 	let link: { href: string; start: number } | undefined;
-	let hidden: { name: string; depth: number } | undefined;
 	while (i < html.length) {
 		const lt = html.indexOf("<", i);
-		if (!hidden) out += html.slice(i, lt === -1 ? html.length : lt);
+		out += html.slice(i, lt === -1 ? html.length : lt);
 		if (lt === -1) break;
+		// A `<` that cannot start a tag, as in `a < b`, is text.
+		if (!/[a-z/!]/i.test(html[lt + 1] ?? "")) {
+			out += "<";
+			i = lt + 1;
+			continue;
+		}
 		if (html.startsWith("<!--", lt)) {
 			const close = html.indexOf("-->", lt + 4);
 			i = close === -1 ? html.length : close + 3;
@@ -314,21 +309,10 @@ export function htmlToText(html: string): string {
 		if (!match) continue;
 		const closing = match[1] === "/";
 		const name = (match[2] ?? "").toLowerCase();
-		if (hidden) {
-			if (name === hidden.name && !VOID.has(name)) {
-				hidden.depth += closing ? -1 : 1;
-				if (hidden.depth === 0) hidden = undefined;
-			}
-			continue;
-		}
 		if (!closing && SKIPPED.has(name)) {
 			const end = new RegExp(`</${name}\\s*>`, "gi");
 			end.lastIndex = i;
 			i = end.exec(html) ? end.lastIndex : html.length;
-			continue;
-		}
-		if (!closing && !VOID.has(name) && HIDDEN.test(tag)) {
-			hidden = { name, depth: 1 };
 			continue;
 		}
 		if (name === "a") {

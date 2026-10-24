@@ -24,7 +24,7 @@ const draftSchema = z
 		bcc: addresses("Bcc recipients, hidden from the others"),
 		subject: z
 			.string()
-			.regex(/^[^\r\n]*$/, "One line")
+			.regex(/^[^\r\n]*$/, "The subject must be a single line")
 			.optional()
 			.describe(
 				"Subject line. For a reply, leave empty to use Re: and the original subject",
@@ -102,7 +102,7 @@ export function registerComposeTools(server: McpServer, mail: Mail) {
 		{
 			title: "Send email",
 			description:
-				"Sends a plain-text email from the user's address right away; it cannot be recalled. Before calling, show the user the recipients, subject, and body and get an explicit yes. A copy goes to Sent. With reply_to_uid it threads as a reply and marks the original answered. Each call sends again.",
+				"Sends a plain-text email from the user's address right away; it cannot be recalled. Before calling, show the user the recipients, subject, and body and get an explicit yes. A copy goes to Sent; `sent_copy` in the result says whether that worked. With reply_to_uid it threads as a reply and marks the original answered. Each call sends again.",
 			inputSchema: draftSchema,
 			annotations: {
 				readOnlyHint: false,

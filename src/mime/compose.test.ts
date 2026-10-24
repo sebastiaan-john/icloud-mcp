@@ -119,5 +119,17 @@ describe("parseAddress", () => {
 		// Non-ASCII addresses would need SMTPUTF8, which the sender does not use.
 		expect(parseAddress("jöhn@example.com")).toBeUndefined();
 		expect(parseAddress(`x${" ".repeat(50_000)}y`)).toBeUndefined();
+		// RFC 5322 specials would make header and envelope recipients differ.
+		for (const odd of [
+			"boss,attacker@evil.example",
+			'"a b"@x.nl',
+			"a@[1.2.3.4]",
+			"x;y:z@evil.example",
+		]) {
+			expect(parseAddress(odd), odd).toBeUndefined();
+		}
+		expect(
+			parseAddress("Bob <bob@x.example>, Eve <eve@evil.example>"),
+		).toBeUndefined();
 	});
 });

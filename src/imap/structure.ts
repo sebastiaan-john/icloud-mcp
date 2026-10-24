@@ -26,8 +26,15 @@ export interface BodyPart {
 	children: BodyPart[];
 }
 
-/** One `<id@host>` message id: printable ASCII, no spaces or angle brackets inside. */
-export const MESSAGE_ID = /^<[\x21-\x3b\x3d\x3f-\x7e]+>$/;
+/**
+ * One `<id@host>` message id: printable ASCII without spaces or angle
+ * brackets, short enough that a reply's header line stays under 998.
+ */
+export const MESSAGE_ID = /^<[\x21-\x3b\x3d\x3f-\x7e]{1,250}>$/;
+
+/** A local part that needs no quoting (RFC 5322 dot-atom). */
+const DOT_ATOM =
+	/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
 
 /** Formats an address as `Name <user@host>` or `user@host`. */
 function formatAddress(name: string | undefined, address: string): string {
@@ -46,7 +53,13 @@ function addresses(value: Value | undefined): string[] {
 		const [name, , mailbox, host] = entry;
 		// Group syntax: a NIL host marks the start or end of a group.
 		if (host === null || host === undefined) continue;
-		const address = `${text(mailbox) ?? ""}@${text(host) ?? ""}`;
+		// ENVELOPE strips the quotes from a local part such as
+		// "service@paypal.com>"; put them back so it cannot pose as an address.
+		const local = text(mailbox) ?? "";
+		const quoted = DOT_ATOM.test(local)
+			? local
+			: `"${local.replace(/["\\]/g, "\\$&")}"`;
+		const address = `${quoted}@${text(host) ?? ""}`;
 		const raw = text(name);
 		const display = raw === undefined ? undefined : decodeHeader(raw).trim();
 		out.push(formatAddress(display, address));

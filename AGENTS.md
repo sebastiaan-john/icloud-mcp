@@ -21,6 +21,7 @@ MCP server (SDK v2, `@modelcontextprotocol/server`) exposing an iCloud Mail acco
 - `src/mail.ts` the `Mail` interface the tools use and `ImapMail`, its implementation.
 - `src/server.ts` builds an `McpServer` per connection or request from `src/tools/*`, grouped as read, organize, compose.
 - `src/http.ts` `Bun.serve` around `createMcpHandler` with a mandatory token.
+- `src/errors.ts` `errorMessage` for unknown caught values.
 
 ## Rules
 
@@ -29,6 +30,6 @@ MCP server (SDK v2, `@modelcontextprotocol/server`) exposing an iCloud Mail acco
 - Fetches always use `BODY.PEEK`, so nothing marks mail read as a side effect; reads open the mailbox with `EXAMINE` unless it is already selected for a write.
 - Pass `{ retry: false }` to `session.run` for anything that must not apply twice (APPEND, MOVE): it checks a reused connection with NOOP first and then runs once. Sends go through SMTP once; a lost reply to the message body becomes `MaybeSentError`.
 - Every user string that reaches IMAP goes through `str` or `quoteMailbox`; part numbers are validated by the tool schema before they reach `BODY[...]`.
-- Mail content is hostile input. Decoded header text has control characters replaced, message ids are kept only when well formed, `compose` refuses a header value with CR or LF, and `htmlToText` must stay linear (no regex that rescans the input per tag).
+- Mail content is hostile input. Decoded header text has control characters replaced, message ids are kept only when well formed, odd local parts are shown quoted, `compose` refuses a header value with CR or LF, and `htmlToText` must stay linear (no regex that rescans the input per tag). Do not try to drop CSS-hidden text: it cannot be detected without a CSS engine and a regex guess drops real content.
 - Every tool carries `annotations` and every argument a `.describe()`; the server test enforces both.
 - Tests use fakes injected through `Mail` or the session's `connect` factory, never module mocks, and never call a real mail server.

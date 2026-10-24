@@ -53,6 +53,8 @@ export class ResponseFramer {
 	private end = 0;
 	/** Where to look for the next CRLF; past any literal already framed. */
 	private scan = 0;
+	/** Where the current line starts: the response start, or just past a literal. */
+	private line = 0;
 	/** Whether the current response has had a literal, so it is past its first line. */
 	private continued = false;
 
@@ -67,16 +69,18 @@ export class ResponseFramer {
 			}
 			const literal =
 				this.continued || !isTextLine(this.buffer, this.start, lf)
-					? literalLength(this.buffer, this.start, lf)
+					? literalLength(this.buffer, this.line, lf)
 					: undefined;
 			if (literal !== undefined) {
 				this.scan = lf + 1 + literal;
+				this.line = this.scan;
 				this.continued = true;
 				continue;
 			}
 			responses.push(this.buffer.slice(this.start, lf + 1));
 			this.start = lf + 1;
 			this.scan = this.start;
+			this.line = this.start;
 			this.continued = false;
 		}
 		return responses;
@@ -94,6 +98,7 @@ export class ResponseFramer {
 				this.buffer.copyWithin(0, this.start, this.end);
 			}
 			this.scan -= this.start;
+			this.line -= this.start;
 			this.end = live;
 			this.start = 0;
 		}
@@ -308,9 +313,7 @@ export function quoteMailbox(name: string): string {
 	return `"${encodeMailbox(name).replace(/["\\]/g, "\\$&")}"`;
 }
 
-export const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(
-	" ",
-);
+const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 
 /** Formats a date for SEARCH SINCE/BEFORE, e.g. `24-Oct-2026`. */
 export function searchDate(date: Date): string {

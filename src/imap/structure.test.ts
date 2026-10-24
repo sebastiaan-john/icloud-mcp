@@ -88,6 +88,15 @@ describe("parseBodyStructure", () => {
 });
 
 describe("parseEnvelope", () => {
+	it("shows a local part that needs quotes with its quotes", () => {
+		const items = fetchLine(
+			`* 2 FETCH (ENVELOPE (NIL "Hi" (("PayPal" NIL "service@paypal.com>" "evil.example")) NIL NIL NIL NIL NIL NIL NIL))`,
+		);
+		expect(parseEnvelope(items.get("ENVELOPE")).from).toEqual([
+			'PayPal <"service@paypal.com>"@evil.example>',
+		]);
+	});
+
 	it("keeps only well-formed message ids, undecoded", () => {
 		const items = fetchLine(
 			`* 2 FETCH (ENVELOPE (NIL "Hi" NIL NIL NIL NIL NIL NIL "<ok@x>" "=?UTF-8?Q?<a@b>=0DBcc:_x@y?="))`,
