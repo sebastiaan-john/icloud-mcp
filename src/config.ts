@@ -5,7 +5,14 @@ const port = z.coerce.number().int().min(1).max(65535);
 
 const envSchema = z
 	.object({
-		ICLOUD_EMAIL: z.email(),
+		// The login, not the sender: iCloud only accepts the Apple address, and
+		// the name part of a custom-domain address would be someone else's.
+		ICLOUD_EMAIL: z
+			.email()
+			.refine(
+				(v) => /@(icloud|me|mac)\.com$/i.test(v),
+				"Use your @icloud.com, @me.com or @mac.com address; put a custom-domain address in ICLOUD_FROM",
+			),
 		ICLOUD_APP_PASSWORD: z.string().trim().min(1),
 		ICLOUD_FROM: z
 			.string()

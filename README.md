@@ -38,7 +38,7 @@ If the host cannot find `bun`, use its full path, for example `~/.bun/bin/bun`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ICLOUD_EMAIL` | required | Your @icloud.com (or @me.com, @mac.com) address. IMAP logs in with the part before the @, SMTP with the whole address, as Apple documents |
+| `ICLOUD_EMAIL` | required | Your @icloud.com (or @me.com, @mac.com) address, even when you send from a custom domain. IMAP logs in with the part before the @, SMTP with the whole address, as Apple documents |
 | `ICLOUD_APP_PASSWORD` | required | The app-specific password |
 | `ICLOUD_FROM` | `ICLOUD_EMAIL` | Sender for outgoing mail, e.g. `Sebastiaan <me@mydomain.com>` for a name or a custom-domain alias |
 | `ICLOUD_IMAP_HOST`, `ICLOUD_IMAP_PORT` | `imap.mail.me.com`, `993` | IMAP over TLS |
