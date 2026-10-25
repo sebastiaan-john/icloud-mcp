@@ -44,6 +44,15 @@ describe("loadConfig", () => {
 		});
 	});
 
+	it("logs in with the Apple address and sends from a custom domain", () => {
+		expect(() =>
+			loadConfig({ ...base, ICLOUD_EMAIL: "hello@example.nl" }),
+		).toThrow("ICLOUD_FROM");
+		const config = loadConfig({ ...base, ICLOUD_FROM: "hello@example.nl" });
+		expect(config.imap.user).toBe("sebastiaan");
+		expect(config.from).toBe("hello@example.nl");
+	});
+
 	it("names the missing and invalid variables", () => {
 		expect(() =>
 			loadConfig({ ICLOUD_EMAIL: "nope", ICLOUD_FROM: "not an address" }),
