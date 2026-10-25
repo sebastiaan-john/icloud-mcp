@@ -5,7 +5,7 @@ import {
 import { timingSafeEqual } from "node:crypto";
 import type { HttpConfig } from "./config";
 
-/** Accepts `Bearer <token>` and a bare token, since some MCP hosts send the configured value as is. */
+/** Accepts `Bearer <token>` and a bare token: xAI's docs leave open whether its `authorization` field adds the prefix. */
 function bearerMatches(header: string | null, token: string): boolean {
 	const value = header?.trim() ?? "";
 	const provided = /^bearer\s+(.+)$/i.exec(value)?.[1] ?? value;

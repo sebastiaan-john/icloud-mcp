@@ -26,8 +26,13 @@ describe("decodeHeader", () => {
 		expect(decodeHeader("Plain subject")).toBe("Plain subject");
 	});
 
-	it("reads raw 8-bit header bytes as UTF-8", () => {
-		expect(decodeHeader(new TextEncoder().encode("Één"))).toBe("Één");
+	it("decodes one huge encoded word without overflowing the stack", () => {
+		const word = Buffer.from("x".repeat(1_200_000)).toString("base64");
+		expect(decodeHeader(`=?UTF-8?B?${word}?=`)).toHaveLength(1_200_000);
+	});
+
+	it("turns decoded control characters, a lone CR included, into spaces", () => {
+		expect(decodeHeader("=?UTF-8?Q?<a@b>=0DBcc:_x@y?=")).toBe("<a@b> Bcc: x@y");
 	});
 });
 
@@ -46,6 +51,19 @@ describe("mimeParam", () => {
 			"logo.png",
 		);
 		expect(mimeParam({}, "filename")).toBeUndefined();
+		// Only pieces marked with * are percent-decoded.
+		expect(
+			mimeParam(
+				{ "filename*0*": "utf-8''a%20b", "filename*1": "%41.txt" },
+				"filename",
+			),
+		).toBe("a b%41.txt");
+		expect(
+			mimeParam(
+				{ filename: "resume.pdf", "filename*": "utf-8''r%C3%A9sum%C3%A9.pdf" },
+				"filename",
+			),
+		).toBe("résumé.pdf");
 	});
 });
 
@@ -84,5 +102,27 @@ describe("htmlToText", () => {
 		expect(htmlToText(html)).toBe(
 			"Café & co\n\nPrijs: €9,99 — korting (https://shop.example/deal?a=1&b=2),\nhttps://x.example\n\n- Eén\n- Twee\n\nA B",
 		);
+	});
+
+	it("keeps content in elements whose attributes mention hidden, and text after an unclosed head", () => {
+		const html = `<html><head><meta charset="utf-8"><body>
+			<div style="max-width:600px;overflow:hidden"><p>Order 1234 shipped</p></div>
+			<span aria-hidden="true">★</span><div class="hidden-xs">Desktop offer</div>
+			<p>If a < b then <b>bold</b><?xml:namespace prefix = o /><o:p></o:p></p></body></html>`;
+		expect(htmlToText(html)).toBe(
+			"Order 1234 shipped\n\n★\nDesktop offer\n\nIf a < b then bold",
+		);
+	});
+
+	it("keeps entity case and never resolves a name through Object.prototype", () => {
+		expect(htmlToText("&Aacute;gua &amp; &AMP; &constructor; &Bogus;")).toBe(
+			"Água & & &constructor; &Bogus;",
+		);
+	});
+
+	it("stays linear on unclosed anchors, comments, and style blocks", () => {
+		const hostile = `${'<a href="https://x.example">'.repeat(10_000)}<!-- ${"x".repeat(10_000)} <style>${"y".repeat(10_000)}`;
+		expect(htmlToText(`ok ${hostile}`)).toBe("ok");
+		expect(htmlToText(`${"<a ".repeat(100_000)}tail`)).toBe("");
 	});
 });

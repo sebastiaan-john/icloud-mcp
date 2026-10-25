@@ -7,13 +7,13 @@ import {
 	parseBodyStructure,
 	parseEnvelope,
 } from "./structure";
-import { fetchItems, parseResponse } from "./wire";
+import { pairs, parseResponse } from "./wire";
 
 /** Parses one FETCH line the way the connection would. */
 function fetchLine(line: string) {
 	const response = parseResponse(new TextEncoder().encode(`${line}\r\n`));
 	if (response.kind !== "data") throw new Error("expected data");
-	return fetchItems(response.values);
+	return pairs(response.values[0]);
 }
 
 // Dovecot's answer for a mixed message: alternative (plain, html), a PDF with
@@ -57,6 +57,19 @@ describe("parseBodyStructure", () => {
 		expect(attachments(htmlOnly)).toEqual([]);
 	});
 
+	it("lists an attached multipart as one file and keeps its text out of the body", () => {
+		const bundle = parseBodyStructure(
+			fetchLine(
+				`* 1 FETCH (BODYSTRUCTURE (("text" "plain" NIL NIL NIL "7bit" 3 1 NIL NIL NIL NIL)(("text" "plain" NIL NIL NIL "7bit" 9 1 NIL NIL NIL NIL)("image" "png" NIL NIL NIL "base64" 40 NIL NIL NIL NIL) "related" NIL ("attachment" ("filename" "bundle.mime")) NIL NIL) "mixed" NIL NIL NIL NIL))`,
+			).get("BODYSTRUCTURE"),
+		);
+		expect(bodyParts(bundle).map((p) => p.part)).toEqual(["1"]);
+		expect(attachments(bundle)).toMatchObject([
+			{ part: "2", type: "multipart/related", filename: "bundle.mime" },
+		]);
+		expect(findPart(bundle, "2")?.type).toBe("multipart/related");
+	});
+
 	it("numbers a single-part message as part 1", () => {
 		const single = parseBodyStructure(
 			fetchLine(
@@ -75,12 +88,36 @@ describe("parseBodyStructure", () => {
 });
 
 describe("parseEnvelope", () => {
+	it("shows a local part that needs quotes with its quotes", () => {
+		const items = fetchLine(
+			`* 2 FETCH (ENVELOPE (NIL "Hi" (("PayPal" NIL "service@paypal.com>" "evil.example")) NIL NIL NIL NIL NIL NIL NIL))`,
+		);
+		expect(parseEnvelope(items.get("ENVELOPE")).from).toEqual([
+			'PayPal <"service@paypal.com>"@evil.example>',
+		]);
+		const literal = fetchLine(
+			`* 2 FETCH (ENVELOPE (NIL "Hi" (("PayPal" NIL "service" "[paypal.com> x]")) NIL NIL NIL NIL NIL NIL NIL))`,
+		);
+		expect(parseEnvelope(literal.get("ENVELOPE")).from).toEqual([
+			'PayPal <service@"[paypal.com> x]">',
+		]);
+	});
+
+	it("keeps only well-formed message ids, undecoded", () => {
+		const items = fetchLine(
+			`* 2 FETCH (ENVELOPE (NIL "Hi" NIL NIL NIL NIL NIL NIL "<ok@x>" "=?UTF-8?Q?<a@b>=0DBcc:_x@y?="))`,
+		);
+		expect(parseEnvelope(items.get("ENVELOPE"))).toMatchObject({
+			inReplyTo: "<ok@x>",
+			messageId: undefined,
+		});
+	});
+
 	it("decodes names and subjects, skips group markers, and formats addresses", () => {
 		const items = fetchLine(
 			`* 2 FETCH (ENVELOPE ("Thu, 22 Oct 2026 16:00:00 +0000" "=?UTF-8?Q?Ren=C3?= =?UTF-8?Q?=A9e?= says hi" (("Doe, Jane" NIL "jane" "example.com")) NIL (("Support" NIL "support" "example.com")) ((NIL NIL "team" NIL)(NIL NIL "a" "x.nl")(NIL NIL NIL NIL)) NIL NIL "<older@x>" "<alt-2@example.com>"))`,
 		);
 		expect(parseEnvelope(items.get("ENVELOPE"))).toEqual({
-			date: "Thu, 22 Oct 2026 16:00:00 +0000",
 			subject: "Renée says hi",
 			from: ['"Doe, Jane" <jane@example.com>'],
 			replyTo: ["Support <support@example.com>"],

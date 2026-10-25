@@ -31,9 +31,8 @@ function headersOf(raw: Uint8Array) {
 
 describe("compose", () => {
 	it("writes encoded headers, threading, and a quoted-printable body that decodes back", () => {
-		const { raw, messageId, recipients } = compose(message, {
-			date: new Date("2026-10-24T21:05:09+02:00"),
-		});
+		const date = new Date("2026-10-24T21:05:09+02:00");
+		const { raw, messageId, recipients } = compose(message, { date });
 		const { text, headers, body } = headersOf(raw);
 		expect(text.split("\r\n").every((line) => line.length <= 78)).toBe(true);
 		expect(decodeHeader(headers.get("subject")!)).toBe(message.subject);
@@ -48,9 +47,7 @@ describe("compose", () => {
 		expect(headers.get("references")).toBe(
 			"<root@example.com> <orig@example.com>",
 		);
-		expect(headers.get("date")).toMatch(
-			/^\w{3}, \d{1,2} \w{3} 2026 \d\d:\d\d:\d\d [+-]\d{4}$/,
-		);
+		expect(new Date(headers.get("date") ?? "").getTime()).toBe(date.getTime());
 		const decoded = decodeCharset(
 			decodeTransfer(Buffer.from(body, "latin1"), "quoted-printable"),
 		);
@@ -66,6 +63,28 @@ describe("compose", () => {
 	it("keeps Bcc as a header for drafts", () => {
 		const { headers } = headersOf(compose(message, { includeBcc: true }).raw);
 		expect(headers.get("bcc")).toBe("secret@example.com, JAN@example.nl");
+	});
+
+	it("sends to addresses as written and refuses a header value with a line break", () => {
+		const { recipients } = compose({
+			...message,
+			to: ["Jan.Smit@Example.nl"],
+			cc: [],
+			bcc: [],
+		});
+		expect(recipients).toEqual(["Jan.Smit@Example.nl"]);
+		expect(() => compose({ ...message, inReplyTo: "<a@b>\rBcc: x@y" })).toThrow(
+			"line break",
+		);
+	});
+
+	it("encodes a long unbroken subject so no line passes 998 characters", () => {
+		const { raw } = compose({ ...message, subject: "x".repeat(1200) });
+		const text = new TextDecoder().decode(raw);
+		expect(text.split("\r\n").every((line) => line.length <= 78)).toBe(true);
+		expect(decodeHeader(headersOf(raw).headers.get("subject") ?? "")).toBe(
+			"x".repeat(1200),
+		);
 	});
 
 	it("rejects something that is not an address", () => {
@@ -96,5 +115,25 @@ describe("parseAddress", () => {
 		});
 		expect(parseAddress("Eve <eve@x.com>\r\nBcc: all@x.com")).toBeUndefined();
 		expect(parseAddress("no-at-sign")).toBeUndefined();
+		expect(parseAddress("Eve\r <eve@x.com>")).toBeUndefined();
+		// Non-ASCII addresses would need SMTPUTF8, which the sender does not use.
+		expect(parseAddress("jöhn@example.com")).toBeUndefined();
+		expect(parseAddress(`x${" ".repeat(50_000)}y`)).toBeUndefined();
+		// RFC 5322 specials would make header and envelope recipients differ.
+		for (const odd of [
+			"boss,attacker@evil.example",
+			'"a b"@x.nl',
+			"a@[1.2.3.4]",
+			"x;y:z@evil.example",
+		]) {
+			expect(parseAddress(odd), odd).toBeUndefined();
+		}
+		expect(
+			parseAddress("Bob <bob@x.example>, Eve <eve@evil.example>"),
+		).toBeUndefined();
+		expect(parseAddress('"ACME <Support>" <help@acme.example>')).toEqual({
+			name: "ACME <Support>",
+			address: "help@acme.example",
+		});
 	});
 });

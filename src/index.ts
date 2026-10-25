@@ -28,4 +28,7 @@ if (config.http) {
 } else {
 	serveStdio(factory);
 	console.error("icloud-mcp listening on stdio");
+	// The host closing stdin ends the session: log out once queued calls
+	// finish, so the IMAP socket does not keep the process alive.
+	process.stdin.once("end", () => void session.close());
 }

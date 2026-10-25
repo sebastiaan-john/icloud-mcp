@@ -4,9 +4,9 @@ import {
 } from "@modelcontextprotocol/client";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it } from "bun:test";
-import type { DraftInput, Mail } from "./mail";
-import { MaybeSentError } from "./mail";
+import type { AttachmentData, DraftInput, Mail } from "./mail";
 import { createServer } from "./server";
+import { MaybeSentError } from "./smtp";
 
 function fakeMail(opts: { sendFails?: Error } = {}) {
 	const calls = {
@@ -16,10 +16,7 @@ function fakeMail(opts: { sendFails?: Error } = {}) {
 		drafts: [] as DraftInput[],
 		sent: [] as DraftInput[],
 	};
-	const files: Record<
-		string,
-		{ contentType: string; filename?: string; data: Uint8Array }
-	> = {
+	const files: Record<string, AttachmentData> = {
 		"2": {
 			contentType: "application/pdf",
 			filename: "factuur.pdf",
@@ -32,7 +29,8 @@ function fakeMail(opts: { sendFails?: Error } = {}) {
 		},
 		"4": {
 			contentType: "text/csv",
-			data: new TextEncoder().encode("a,b\n1,2"),
+			charset: "windows-1252",
+			data: new Uint8Array([99, 97, 102, 233]),
 		},
 	};
 	const mail: Mail = {
@@ -45,15 +43,15 @@ function fakeMail(opts: { sendFails?: Error } = {}) {
 				unread: 0,
 			},
 		],
-		search: async (mailbox, query, offset, limit) => {
-			calls.search.push([mailbox, query, offset, limit]);
+		search: async (mailbox, query, page) => {
+			calls.search.push([mailbox, query, page]);
 			return {
 				total: 3,
 				messages: [
 					{
 						uid: 7,
 						date: "2026-10-24T09:15:00+02:00",
-						from: "Jan <jan@example.nl>",
+						from: ["Jan <jan@example.nl>"],
 						to: ["sebastiaan@icloud.com"],
 						subject: "Koffie?",
 						unread: true,
@@ -181,7 +179,7 @@ describe("icloud-mcp server", () => {
 			arguments: { from: "jan", unread: true, limit: 1 },
 		});
 		expect(calls.search).toEqual([
-			["INBOX", { from: "jan", unread: true }, 0, 1],
+			["INBOX", { from: "jan", unread: true }, { offset: 0, limit: 1 }],
 		]);
 		expect(payload(result)).toMatchObject({
 			mailbox: "INBOX",
@@ -190,11 +188,18 @@ describe("icloud-mcp server", () => {
 			has_more: true,
 			messages: [{ uid: 7, subject: "Koffie?" }],
 		});
-		const bad = await client.callTool({
+		for (const since of ["24-10-2026", "2026-02-31"]) {
+			const bad = await client.callTool({
+				name: "mail_search",
+				arguments: { since },
+			});
+			expect(bad.isError, since).toBe(true);
+		}
+		await client.callTool({
 			name: "mail_search",
-			arguments: { since: "24-10-2026" },
+			arguments: { since: "2026-10-01" },
 		});
-		expect(bad.isError).toBe(true);
+		expect(calls.search[1]?.[1]).toEqual({ since: new Date("2026-10-01") });
 	});
 
 	it("reads with the default body limit", async () => {
@@ -221,7 +226,7 @@ describe("icloud-mcp server", () => {
 			data: "iVBORw==",
 			mimeType: "image/png",
 		});
-		expect(text(await get("4"))).toContain("a,b\n1,2");
+		expect(text(await get("4"))).toContain("café");
 		const pdf = await get("2");
 		expect(pdf.content[1]).toMatchObject({
 			type: "resource",
@@ -282,6 +287,50 @@ describe("icloud-mcp server", () => {
 				reply: { mailbox: "INBOX", uid: 7, all: true },
 			},
 		]);
+	});
+
+	it("sends with every recipient field and rejects reply_all without a message", async () => {
+		const { mail, calls } = fakeMail();
+		await connect(mail);
+		const orphan = await client.callTool({
+			name: "mail_send",
+			arguments: { to: ["a@b.nl"], subject: "x", body: "x", reply_all: true },
+		});
+		expect(orphan.isError).toBe(true);
+		const result = await client.callTool({
+			name: "mail_send",
+			arguments: {
+				to: ["Jan <jan@example.nl>"],
+				cc: ["piet@x.nl"],
+				bcc: ["secret@x.nl"],
+				body: "Prima",
+				reply_to_uid: 7,
+			},
+		});
+		expect(calls.sent).toEqual([
+			{
+				to: ["Jan <jan@example.nl>"],
+				cc: ["piet@x.nl"],
+				bcc: ["secret@x.nl"],
+				subject: undefined,
+				body: "Prima",
+				reply: { mailbox: "INBOX", uid: 7, all: false },
+			},
+		]);
+		expect(payload(result)).toMatchObject({ message_id: "<s@icloud.com>" });
+	});
+
+	it("reports moved and missing UIDs", async () => {
+		await connect(fakeMail().mail);
+		const result = await client.callTool({
+			name: "mail_move",
+			arguments: { uids: [3, 500], to: "Deleted Messages" },
+		});
+		expect(payload(result)).toEqual({
+			moved: [3],
+			to: "Deleted Messages",
+			not_found: [500],
+		});
 	});
 
 	it("warns against resending when a send may have gone through", async () => {

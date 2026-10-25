@@ -65,10 +65,10 @@ const ENCODED_WORD = /=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=/g;
 /**
  * Decodes RFC 2047 encoded words such as `=?UTF-8?Q?Caf=C3=A9?=`. Adjacent
  * words in the same charset are joined before decoding, so a character split
- * across two words survives. Raw 8-bit header bytes are read as UTF-8.
+ * across two words survives. Control characters, a lone CR included, become
+ * spaces so a decoded value can never break a header line.
  */
-export function decodeHeader(value: string | Uint8Array): string {
-	const raw = typeof value === "string" ? value : utf8.decode(value);
+export function decodeHeader(raw: string): string {
 	let out = "";
 	let last = 0;
 	let run: { charset: string; bytes: number[] } | undefined;
@@ -88,11 +88,17 @@ export function decodeHeader(value: string | Uint8Array): string {
 		if (!adjacent || run?.charset !== charset) flush();
 		if (!adjacent) out += between;
 		run ??= { charset, bytes: [] };
-		run.bytes.push(...wordBytes(kind, payload));
+		// A loop, not push(...bytes): one huge word would overflow the stack.
+		for (const byte of wordBytes(kind, payload)) run.bytes.push(byte);
 		last = match.index + match[0].length;
 	}
 	flush();
-	return (out + raw.slice(last)).replace(/\r?\n[ \t]*/g, " ");
+	return (
+		(out + raw.slice(last))
+			.replace(/\r?\n[ \t]*/g, " ")
+			// oxlint-disable-next-line no-control-regex -- matching control characters is the point
+			.replace(/[\x00-\x1f\x7f]/g, " ")
+	);
 }
 
 function wordBytes(kind: string, payload: string): Uint8Array {
@@ -103,103 +109,126 @@ function wordBytes(kind: string, payload: string): Uint8Array {
 
 /** `UTF-8*nl` (RFC 2231 language suffix) becomes `UTF-8`. */
 function stripLanguage(charset: string): string {
-	return charset.split("*")[0]!;
+	return charset.replace(/\*.*/s, "");
 }
 
 /**
- * Reads a MIME parameter such as `filename`, handling RFC 2231 extended and
- * continued values (`filename*0*=utf-8''Re%CC%81sume%CC%81;`) and encoded
- * words, which many mailers put in `name`.
+ * Reads a MIME parameter such as `filename`. An RFC 2231 extended value
+ * (`filename*=utf-8''R%C3%A9sum%C3%A9.pdf`) or continuation
+ * (`filename*0*`, `filename*1`, ...) wins over the plain one, which mailers
+ * add as an ASCII fallback; encoded words in a plain value are decoded.
  */
 export function mimeParam(
 	params: Record<string, string>,
 	name: string,
 ): string | undefined {
-	const plain = params[name];
-	if (plain !== undefined) return decodeHeader(plain);
 	const extended = params[`${name}*`];
-	if (extended !== undefined) return decode2231(extended);
-	const pieces: string[] = [];
-	let encoded = false;
+	if (extended !== undefined) return decode2231([[extended, true]]);
+	const pieces: Array<[string, boolean]> = [];
 	for (let i = 0; ; i++) {
-		const piece = params[`${name}*${i}*`] ?? params[`${name}*${i}`];
+		const encoded = params[`${name}*${i}*`];
+		const piece = encoded ?? params[`${name}*${i}`];
 		if (piece === undefined) break;
-		if (params[`${name}*${i}*`] !== undefined && i === 0) encoded = true;
-		pieces.push(piece);
+		pieces.push([piece, encoded !== undefined]);
 	}
-	if (pieces.length === 0) return undefined;
-	const joined = pieces.join("");
-	return encoded ? decode2231(joined) : decodeHeader(joined);
+	if (pieces.length > 0) return decode2231(pieces);
+	const plain = params[name];
+	return plain === undefined ? undefined : decodeHeader(plain);
 }
 
-function decode2231(value: string): string {
-	const match = /^([^']*)'[^']*'(.*)$/s.exec(value);
-	const charset = match?.[1] || "utf-8";
-	const encoded = match ? match[2]! : value;
+/**
+ * Joins RFC 2231 pieces into bytes: pieces marked encoded are
+ * percent-decoded, the rest taken as is, and the first encoded piece names
+ * the charset as `charset'language'`.
+ */
+function decode2231(pieces: Array<[string, boolean]>): string {
+	let charset = "utf-8";
 	const bytes: number[] = [];
-	for (let i = 0; i < encoded.length; i++) {
-		const hex = encoded.slice(i + 1, i + 3);
-		if (encoded[i] === "%" && /^[0-9A-Fa-f]{2}$/.test(hex)) {
-			bytes.push(Number.parseInt(hex, 16));
-			i += 2;
-		} else {
-			bytes.push(encoded.charCodeAt(i) & 0xff);
+	for (const [index, [piece, encoded]] of pieces.entries()) {
+		let value = piece;
+		if (encoded && index === 0) {
+			const match = /^([^']*)'[^']*'(.*)$/s.exec(piece);
+			if (match) {
+				charset = match[1] || charset;
+				value = match[2] ?? "";
+			}
+		}
+		for (let i = 0; i < value.length; i++) {
+			const hex = value.slice(i + 1, i + 3);
+			if (encoded && value[i] === "%" && /^[0-9A-Fa-f]{2}$/.test(hex)) {
+				bytes.push(Number.parseInt(hex, 16));
+				i += 2;
+			} else {
+				bytes.push(value.charCodeAt(i) & 0xff);
+			}
 		}
 	}
 	return decodeCharset(new Uint8Array(bytes), charset);
 }
 
-const ENTITIES: Record<string, string> = {
-	amp: "&",
-	lt: "<",
-	gt: ">",
-	quot: '"',
-	apos: "'",
-	nbsp: " ",
-	copy: "©",
-	reg: "®",
-	trade: "™",
-	hellip: "…",
-	mdash: "—",
-	ndash: "–",
-	lsquo: "‘",
-	rsquo: "’",
-	ldquo: "“",
-	rdquo: "”",
-	laquo: "«",
-	raquo: "»",
-	bull: "•",
-	middot: "·",
-	euro: "€",
-	pound: "£",
-	deg: "°",
-	times: "×",
-	shy: "",
-	zwnj: "",
-	zwj: "",
-	agrave: "à",
-	aacute: "á",
-	acirc: "â",
-	auml: "ä",
-	ccedil: "ç",
-	egrave: "è",
-	eacute: "é",
-	ecirc: "ê",
-	euml: "ë",
-	iacute: "í",
-	iuml: "ï",
-	ntilde: "ñ",
-	oacute: "ó",
-	ocirc: "ô",
-	ouml: "ö",
-	uacute: "ú",
-	uuml: "ü",
-	szlig: "ß",
-	Auml: "Ä",
-	Eacute: "É",
-	Ouml: "Ö",
-	Uuml: "Ü",
-};
+/** A Map, so a name like `constructor` cannot reach Object.prototype. */
+const ENTITIES = new Map<string, string>(
+	Object.entries({
+		amp: "&",
+		lt: "<",
+		gt: ">",
+		quot: '"',
+		apos: "'",
+		nbsp: " ",
+		copy: "©",
+		reg: "®",
+		trade: "™",
+		hellip: "…",
+		mdash: "—",
+		ndash: "–",
+		lsquo: "‘",
+		rsquo: "’",
+		ldquo: "“",
+		rdquo: "”",
+		laquo: "«",
+		raquo: "»",
+		bull: "•",
+		middot: "·",
+		euro: "€",
+		pound: "£",
+		deg: "°",
+		times: "×",
+		shy: "",
+		zwnj: "",
+		zwj: "",
+		agrave: "à",
+		aacute: "á",
+		acirc: "â",
+		auml: "ä",
+		ccedil: "ç",
+		egrave: "è",
+		eacute: "é",
+		ecirc: "ê",
+		euml: "ë",
+		iacute: "í",
+		iuml: "ï",
+		ntilde: "ñ",
+		oacute: "ó",
+		ocirc: "ô",
+		ouml: "ö",
+		uacute: "ú",
+		uuml: "ü",
+		szlig: "ß",
+		AMP: "&",
+		LT: "<",
+		GT: ">",
+		QUOT: '"',
+		Aacute: "Á",
+		Agrave: "À",
+		Auml: "Ä",
+		Ccedil: "Ç",
+		Egrave: "È",
+		Ntilde: "Ñ",
+		Eacute: "É",
+		Ouml: "Ö",
+		Uuml: "Ü",
+	}),
+);
 
 function decodeEntities(text: string): string {
 	return text.replace(
@@ -214,42 +243,101 @@ function decodeEntities(text: string): string {
 					? String.fromCodePoint(code)
 					: whole;
 			}
-			return ENTITIES[name] ?? ENTITIES[name.toLowerCase()] ?? whole;
+			return ENTITIES.get(name) ?? whole;
 		},
 	);
 }
 
+const SKIPPED = new Set(["style", "script", "title", "template"]);
+const BLOCKS = new Set([
+	"p",
+	"div",
+	"tr",
+	"table",
+	"h1",
+	"h2",
+	"h3",
+	"h4",
+	"h5",
+	"h6",
+	"ul",
+	"ol",
+	"blockquote",
+	"section",
+	"article",
+	"header",
+	"footer",
+	"br",
+	"hr",
+]);
+const HREF = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
+
 /**
  * Renders HTML mail as plain text for a model to read: block elements become
- * line breaks, links keep their target as `text (url)`, and head, style,
- * script, and comments are dropped.
+ * line breaks, links keep their target as `text (url)`, and style, script,
+ * title, and comments are dropped. Text hidden with CSS is kept; telling it
+ * apart takes a CSS engine, and the plain-text part a sender also controls
+ * is read as is anyway.
+ *
+ * One pass over the input with `indexOf`, so an unclosed tag or comment
+ * costs linear time.
  */
 export function htmlToText(html: string): string {
-	const text = html
-		.replace(/<!--[\s\S]*?-->/g, "")
-		.replace(/<(head|style|script|title)\b[\s\S]*?<\/\1\s*>/gi, "")
-		.replace(
-			/<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a\s*>/gi,
-			(_, d: string, s: string, b: string, inner: string) => {
-				const href = decodeEntities(d ?? s ?? b ?? "").trim();
-				const label = inner.replace(/<[^>]*>/g, "").trim();
-				if (!label) return "";
-				const plainLabel = decodeEntities(label).replace(/\s+/g, " ");
-				if (!/^(https?|mailto):/i.test(href) || plainLabel === href)
-					return label;
-				return `${label} (${href.replace(/^mailto:/i, "")})`;
-			},
-		)
-		.replace(/<li\b[^>]*>/gi, "\n- ")
-		.replace(/<(br|hr)\b[^>]*>/gi, "\n")
-		.replace(
-			/<\/(p|div|tr|table|h[1-6]|ul|ol|blockquote|section|article|header|footer)\s*>/gi,
-			"\n",
-		)
-		.replace(/<(p|div|tr|table|h[1-6]|blockquote)\b[^>]*>/gi, "\n")
-		.replace(/<\/t[dh]\s*>/gi, " ")
-		.replace(/<[^>]*>/g, "");
-	return tidy(decodeEntities(text));
+	let out = "";
+	let i = 0;
+	let link: { href: string; start: number } | undefined;
+	while (i < html.length) {
+		const lt = html.indexOf("<", i);
+		out += html.slice(i, lt === -1 ? html.length : lt);
+		if (lt === -1) break;
+		// A `<` that cannot start a tag or `<?xml ...?>`, as in `a < b`, is text.
+		if (!/[a-z/!?]/i.test(html[lt + 1] ?? "")) {
+			out += "<";
+			i = lt + 1;
+			continue;
+		}
+		if (html.startsWith("<!--", lt)) {
+			const close = html.indexOf("-->", lt + 4);
+			i = close === -1 ? html.length : close + 3;
+			continue;
+		}
+		const gt = html.indexOf(">", lt);
+		if (gt === -1) break;
+		i = gt + 1;
+		const tag = html.slice(lt + 1, gt);
+		const match = /^(\/?)([a-z][a-z0-9]*)/i.exec(tag);
+		if (!match) continue;
+		const closing = match[1] === "/";
+		const name = (match[2] ?? "").toLowerCase();
+		if (!closing && SKIPPED.has(name)) {
+			const end = new RegExp(`</${name}\\s*>`, "gi");
+			end.lastIndex = i;
+			i = end.exec(html) ? end.lastIndex : html.length;
+			continue;
+		}
+		if (name === "a") {
+			if (!closing) {
+				const href = HREF.exec(tag);
+				const value = href?.[1] ?? href?.[2] ?? href?.[3];
+				link =
+					value === undefined ? undefined : { href: value, start: out.length };
+			} else if (link) {
+				const label = decodeEntities(out.slice(link.start)).trim();
+				const href = decodeEntities(link.href).trim();
+				if (label && label !== href && /^(https?|mailto):/i.test(href)) {
+					out += ` (${link.href.trim().replace(/^mailto:/i, "")})`;
+				}
+				link = undefined;
+			}
+		} else if (name === "li" && !closing) {
+			out += "\n- ";
+		} else if ((name === "td" || name === "th") && closing) {
+			out += " ";
+		} else if (BLOCKS.has(name) && !(closing && name === "li")) {
+			out += "\n";
+		}
+	}
+	return tidy(decodeEntities(out));
 }
 
 /**

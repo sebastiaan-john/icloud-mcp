@@ -37,7 +37,7 @@ const envSchema = z
 			host: e.ICLOUD_IMAP_HOST,
 			port: e.ICLOUD_IMAP_PORT,
 			// iCloud IMAP takes the name part of the address; SMTP takes all of it.
-			user: e.ICLOUD_EMAIL.split("@")[0]!,
+			user: e.ICLOUD_EMAIL.replace(/@.*/, ""),
 			password: e.ICLOUD_APP_PASSWORD,
 		},
 		smtp: {

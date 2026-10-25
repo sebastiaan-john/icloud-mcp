@@ -16,41 +16,65 @@ export interface Composed {
 	messageId: string;
 	/** RFC 5322 bytes with CRLF line endings. */
 	raw: Uint8Array;
-	/** Envelope recipients for SMTP: To, Cc, and Bcc, deduplicated. */
+	/** Envelope recipients for SMTP: To, Cc, and Bcc, deduplicated, case kept. */
 	recipients: string[];
 }
 
-const ADDRESS = /^(?:(.*?)\s*<([^<>\s@]+@[^<>\s@]+)>|([^<>\s@]+@[^<>\s@]+))$/;
+/**
+ * `user@host` with a dot-atom local part and a plain domain. Quoted local
+ * parts, address literals, and non-ASCII addresses (which need SMTPUTF8,
+ * not negotiated here) are refused rather than sent ambiguously.
+ */
+const ADDR_SPEC =
+	/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/;
 
 /** Splits `Name <user@host>` into its parts; undefined when it is not an address. */
 export function parseAddress(
 	value: string,
 ): { name?: string; address: string } | undefined {
-	const match = ADDRESS.exec(value.trim());
-	if (!match) return undefined;
-	const address = match[2] ?? match[3]!;
-	const name = match[1]
-		?.replace(/^"(.*)"$/, "$1")
+	const trimmed = value.trim();
+	if (!trimmed.endsWith(">")) {
+		return ADDR_SPEC.test(trimmed) ? { address: trimmed } : undefined;
+	}
+	const open = trimmed.lastIndexOf("<");
+	const address = trimmed.slice(open + 1, -1);
+	const rawName = trimmed.slice(0, Math.max(open, 0));
+	if (
+		open === -1 ||
+		!ADDR_SPEC.test(address) ||
+		// An unquoted name holding `<` or `>` is a second address squeezed in.
+		(!/^\s*".*"\s*$/s.test(rawName) && /[<>]/.test(rawName)) ||
+		// oxlint-disable-next-line no-control-regex -- a display name must not break a header line
+		/[\x00-\x1f\x7f]/.test(rawName)
+	) {
+		return undefined;
+	}
+	const name = rawName
+		.trim()
+		.replace(/^"(.*)"$/s, "$1")
 		.replace(/\\(.)/g, "$1")
 		.trim();
 	return { name: name || undefined, address };
 }
 
-export function bareAddress(value: string): string {
-	return parseAddress(value)?.address.toLowerCase() ?? value.toLowerCase();
+/** The `user@host` part of an address as written, or undefined when it does not parse. */
+export function bareAddress(value: string): string | undefined {
+	return parseAddress(value)?.address;
 }
 
 /**
  * Builds a text/plain UTF-8 message. Bcc is never written as a header unless
- * `includeBcc` is set, which drafts use so the recipient list survives.
+ * `includeBcc` is set, which drafts and the Sent copy use so the recipient
+ * list survives. Pass `messageId` to compose a second copy of one message.
  */
 export function compose(
 	message: Outgoing,
-	options: { includeBcc?: boolean; date?: Date } = {},
+	options: { includeBcc?: boolean; date?: Date; messageId?: string } = {},
 ): Composed {
 	const domain =
 		parseAddress(message.from)?.address.split("@")[1] ?? "localhost";
-	const messageId = `<${randomBytes(16).toString("hex")}@${domain}>`;
+	const messageId =
+		options.messageId ?? `<${randomBytes(16).toString("hex")}@${domain}>`;
 	const headers: Array<[string, string]> = [
 		["From", addressList([message.from])],
 		["Date", formatDate(options.date ?? new Date())],
@@ -72,13 +96,29 @@ export function compose(
 		["Content-Transfer-Encoding", "quoted-printable"],
 	);
 	const head = headers
-		.map(([name, value]) => fold(`${name}: ${value}`))
+		.map(([name, value]) => {
+			// Every value above is encoded or validated; this guards the invariant.
+			if (/[\r\n]/.test(value)) {
+				throw new Error(`The ${name} header would contain a line break`);
+			}
+			return fold(`${name}: ${value}`);
+		})
 		.join("\r\n");
 	const raw = `${head}\r\n\r\n${encodeQuotedPrintable(message.body)}\r\n`;
-	const recipients = [
-		...new Set([...message.to, ...message.cc, ...message.bcc].map(bareAddress)),
-	];
-	return { messageId, raw: new TextEncoder().encode(raw), recipients };
+	const recipients = new Map<string, string>();
+	for (const value of [...message.to, ...message.cc, ...message.bcc]) {
+		const address = bareAddress(value);
+		if (!address) throw new Error(`Not an email address: ${value}`);
+		// Domains are case-insensitive and local parts nearly always are; the
+		// address goes out as written.
+		const key = address.toLowerCase();
+		if (!recipients.has(key)) recipients.set(key, address);
+	}
+	return {
+		messageId,
+		raw: new TextEncoder().encode(raw),
+		recipients: [...recipients.values()],
+	};
 }
 
 function addressList(values: string[]): string {
@@ -87,22 +127,25 @@ function addressList(values: string[]): string {
 			const parsed = parseAddress(value);
 			if (!parsed) throw new Error(`Not an email address: ${value}`);
 			if (!parsed.name) return parsed.address;
-			const name = /^[\x20-\x7e]*$/.test(parsed.name)
-				? /[()<>[\]:;@\\,."]/.test(parsed.name)
-					? `"${parsed.name.replace(/["\\]/g, "\\$&")}"`
-					: parsed.name
-				: encodeWords(parsed.name);
-			return `${name} <${parsed.address}>`;
+			return `${displayName(parsed.name)} <${parsed.address}>`;
 		})
 		.join(", ");
 }
 
+/** A display name as an atom, a quoted string, or encoded words when it is not ASCII. */
+function displayName(name: string): string {
+	if (!/^[\x20-\x7e]*$/.test(name)) return encodeWords(name);
+	if (!/[()<>[\]:;@\\,."]/.test(name)) return name;
+	return `"${name.replace(/["\\]/g, "\\$&")}"`;
+}
+
 /**
- * Encodes non-ASCII header text as RFC 2047 base64 words, at most 45 bytes
- * of UTF-8 per word so each stays under the 75-character limit.
+ * Encodes header text as RFC 2047 base64 words, at most 45 bytes of UTF-8
+ * per word so each stays under the 75-character limit. Plain ASCII stays as
+ * is unless it has a run too long to fold at a space.
  */
-export function encodeWords(value: string): string {
-	if (/^[\x20-\x7e]*$/.test(value)) return value;
+function encodeWords(value: string): string {
+	if (/^[\x20-\x7e]*$/.test(value) && !/\S{70}/.test(value)) return value;
 	const encoder = new TextEncoder();
 	const words: string[] = [];
 	let chunk = "";
@@ -137,15 +180,15 @@ function fold(line: string): string {
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
+const DAYS = "Sun Mon Tue Wed Thu Fri Sat".split(" ");
+const MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
 
 /** `Sat, 24 Oct 2026 23:05:09 +0200`, in the local time zone. */
-export function formatDate(date: Date): string {
-	const days = "Sun Mon Tue Wed Thu Fri Sat".split(" ");
-	const months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(" ");
+function formatDate(date: Date): string {
 	const offset = -date.getTimezoneOffset();
 	const sign = offset >= 0 ? "+" : "-";
 	const zone = `${sign}${pad(Math.floor(Math.abs(offset) / 60))}${pad(Math.abs(offset) % 60)}`;
-	return `${days[date.getDay()]}, ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${zone}`;
+	return `${DAYS[date.getDay()]}, ${date.getDate()} ${MONTHS[date.getMonth()]} ${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${zone}`;
 }
 
 /** Quoted-printable over UTF-8, with soft breaks at 76 characters and CRLF line ends. */

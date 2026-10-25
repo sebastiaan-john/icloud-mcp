@@ -2,7 +2,6 @@ import { decodeHeader, mimeParam } from "../mime/decode";
 import { text, type Value } from "./wire";
 
 export interface Envelope {
-	date?: string;
 	subject: string;
 	from: string[];
 	replyTo: string[];
@@ -27,11 +26,26 @@ export interface BodyPart {
 	children: BodyPart[];
 }
 
+/**
+ * One `<id@host>` message id: printable ASCII without spaces or angle
+ * brackets, short enough that a reply's header line stays under 998.
+ */
+export const MESSAGE_ID = /^<[\x21-\x3b\x3d\x3f-\x7e]{1,250}>$/;
+
+/** A host that is a plain domain, not a `[...]` literal. */
+const DOMAIN = /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$/;
+
+/** A local part that needs no quoting (RFC 5322 dot-atom). */
+const DOT_ATOM =
+	/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
+
+/** Quotes an address part that is not in its plain form. */
+function quote(part: string, plain: RegExp): string {
+	return plain.test(part) ? part : `"${part.replace(/["\\]/g, "\\$&")}"`;
+}
+
 /** Formats an address as `Name <user@host>` or `user@host`. */
-export function formatAddress(
-	name: string | undefined,
-	address: string,
-): string {
+function formatAddress(name: string | undefined, address: string): string {
 	if (!name || name === address) return address;
 	const quoted = /[",<>@;:]/.test(name)
 		? `"${name.replace(/["\\]/g, "\\$&")}"`
@@ -47,33 +61,34 @@ function addresses(value: Value | undefined): string[] {
 		const [name, , mailbox, host] = entry;
 		// Group syntax: a NIL host marks the start or end of a group.
 		if (host === null || host === undefined) continue;
-		const address = `${text(mailbox) ?? ""}@${text(host) ?? ""}`;
-		const display =
-			name === null || name === undefined
-				? undefined
-				: decodeHeader(text(name)!);
-		out.push(formatAddress(display?.trim(), address));
+		// ENVELOPE strips the quotes from a local part such as
+		// "service@paypal.com>"; put them back so it cannot pose as an
+		// address, and do the same for an odd host.
+		const address = `${quote(text(mailbox) ?? "", DOT_ATOM)}@${quote(text(host) ?? "", DOMAIN)}`;
+		const raw = text(name);
+		const display = raw === undefined ? undefined : decodeHeader(raw).trim();
+		out.push(formatAddress(display, address));
 	}
 	return out;
 }
 
 export function parseEnvelope(value: Value | undefined): Envelope {
 	const v = Array.isArray(value) ? value : [];
-	const header = (i: number) => {
-		const raw = v[i];
-		return raw === null || raw === undefined
-			? undefined
-			: decodeHeader(text(raw)!);
+	const subject = text(v[1]);
+	// Message ids are taken as written, never decoded, and kept only when
+	// well formed, since they are copied into the headers of a reply.
+	const id = (i: number) => {
+		const raw = text(v[i])?.trim();
+		return raw && MESSAGE_ID.test(raw) ? raw : undefined;
 	};
 	return {
-		date: header(0),
-		subject: header(1) ?? "",
+		subject: subject === undefined ? "" : decodeHeader(subject),
 		from: addresses(v[2]),
 		replyTo: addresses(v[4]),
 		to: addresses(v[5]),
 		cc: addresses(v[6]),
-		inReplyTo: header(8)?.trim() || undefined,
-		messageId: header(9)?.trim() || undefined,
+		inReplyTo: id(8),
+		messageId: id(9),
 	};
 }
 
@@ -104,14 +119,17 @@ export function parseBodyStructure(
 			i++;
 		}
 		const subtype = (text(v[i]) ?? "mixed").toLowerCase();
-		const dispositionValue = v[i + 2];
+		const { type: dispositionType, params: dispositionParams } = disposition(
+			v[i + 2],
+		);
 		return {
 			part,
 			type: `multipart/${subtype}`,
 			params: paramRecord(v[i + 1]),
 			encoding: "7bit",
 			size: children.reduce((sum, c) => sum + c.size, 0),
-			disposition: disposition(dispositionValue).type,
+			disposition: dispositionType,
+			filename: mimeParam(dispositionParams, "filename")?.trim() || undefined,
 			children,
 		};
 	}
@@ -119,11 +137,9 @@ export function parseBodyStructure(
 	const params = paramRecord(v[2]);
 	// Extension data follows the basic fields: lines for text, envelope,
 	// body, and lines for message/rfc822, then md5 and disposition.
-	const extra = type.startsWith("text/")
-		? 1
-		: type === "message/rfc822"
-			? 3
-			: 0;
+	let extra = 0;
+	if (type.startsWith("text/")) extra = 1;
+	if (type === "message/rfc822") extra = 3;
 	const { type: dispositionType, params: dispositionParams } = disposition(
 		v[7 + extra + 1],
 	);
@@ -149,6 +165,7 @@ function disposition(value: Value | undefined) {
 	};
 }
 
+/** A file: a filename, an attachment disposition, or a forwarded message. */
 function isAttachment(part: BodyPart): boolean {
 	return (
 		part.disposition === "attachment" ||
@@ -163,9 +180,11 @@ function isAttachment(part: BodyPart): boolean {
  * counts, in order.
  */
 export function bodyParts(root: BodyPart): BodyPart[] {
+	if (root.part !== "" && isAttachment(root)) return [];
 	if (root.children.length === 0) {
-		const readable = root.type === "text/plain" || root.type === "text/html";
-		return readable && !isAttachment(root) ? [root] : [];
+		return root.type === "text/plain" || root.type === "text/html"
+			? [root]
+			: [];
 	}
 	if (root.type === "multipart/alternative") {
 		const options = root.children.map((child) => bodyParts(child));
@@ -180,14 +199,14 @@ export function bodyParts(root: BodyPart): BodyPart[] {
 	return root.children.flatMap((child) => bodyParts(child));
 }
 
-/** Leaves that are files: a filename, an attachment disposition, or a forwarded message. */
+/** The files in a message; an attached multipart counts as one file. */
 export function attachments(root: BodyPart): BodyPart[] {
-	if (root.children.length === 0) return isAttachment(root) ? [root] : [];
+	if (root.part !== "" && isAttachment(root)) return [root];
 	return root.children.flatMap((child) => attachments(child));
 }
 
 export function findPart(root: BodyPart, part: string): BodyPart | undefined {
-	if (root.part === part && root.children.length === 0) return root;
+	if (root.part === part) return root;
 	for (const child of root.children) {
 		const found = findPart(child, part);
 		if (found) return found;

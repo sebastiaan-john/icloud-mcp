@@ -56,7 +56,7 @@ export ICLOUD_HTTP_TOKEN=$(openssl rand -hex 24); echo "$ICLOUD_HTTP_TOKEN"
 ICLOUD_HTTP_PORT=3000 ICLOUD_EMAIL=you@icloud.com ICLOUD_APP_PASSWORD=... bun src/index.ts
 ```
 
-The endpoint is `/mcp`. Requests need `Authorization: Bearer <token>`; a bare token without `Bearer` is accepted too, since some hosts send the configured value as is. The token is the only access control. It also stops browser pages from reaching the server through DNS rebinding, since they do not know it.
+The endpoint is `/mcp`. Requests need `Authorization: Bearer <token>`; a bare token without `Bearer` is accepted too, because xAI's docs do not say whether its `authorization` field adds the prefix. Bind to anything other than 127.0.0.1 only behind TLS, since the token travels in every request. The token is the only access control. It also stops browser pages from reaching the server through DNS rebinding, since they do not know it.
 
 xAI's API connects to remote MCP servers itself rather than through your machine, so the endpoint has to be reachable over public HTTPS, for example through Tailscale Funnel or a Cloudflare Tunnel in front of port 3000. Then add it to a request:
 
@@ -89,9 +89,11 @@ Messages are addressed by mailbox name plus UID. `mail_search` returns UIDs; a U
 | `mail_save_draft` | Save a plain-text message or reply to Drafts |
 | `mail_send` | Send a plain-text message or reply, then file a copy in Sent |
 
-Replies take `reply_to_uid`: the server fills in `In-Reply-To`, `References`, the `Re:` subject, and the recipients (`reply_all` copies everyone else on the original), and marks the original answered after sending.
+Replies take `reply_to_uid`: the server fills in `In-Reply-To`, `References`, the `Re:` subject, and the recipients (`reply_all` copies everyone else on the original, up to 50 people in total), and marks the original answered after sending. Addresses must be ASCII; the server does not use SMTPUTF8.
 
-Sending cannot be undone, and the tool description tells the model to confirm with you first. If the SMTP connection drops after the message was handed over, the error says it may have been sent and to check Sent before retrying. Sources disagree on whether iCloud files SMTP mail in Sent by itself, so after sending the server looks for the Message-ID in Sent and appends a copy only when it is missing.
+Email comes from strangers, and an assistant reading it can be steered by what it says, including text the sender hid from human readers. The server instructions tell the model to treat message content as data, which helps but is no guarantee. `mail_send` is the one tool that acts outside the mailbox, which is why the Grok example above leaves it out.
+
+Sending cannot be undone, and the tool description tells the model to confirm with you first. If the SMTP connection drops after the message was handed over, the error says it may have been sent and to check Sent before retrying. iCloud may or may not file SMTP mail in Sent by itself, so after sending the server looks for the Message-ID in Sent and appends a copy, Bcc included, only when it is missing.
 
 No tool deletes mail permanently; deleting means moving to the trash mailbox, from where you can still restore it.
 
@@ -102,7 +104,7 @@ bun run check   # oxlint, oxfmt --check, tsc, bun test
 bun run lint    # fix and format
 ```
 
-Tests are colocated as `*.test.ts`. The server tests drive the real MCP handler through `@modelcontextprotocol/client` with a fake mailbox, and the session tests run the IMAP client against a scripted server on a local socket. Nothing in the suite talks to a real mail server.
+Tests are colocated as `*.test.ts`. The server tests drive the real MCP handler through `@modelcontextprotocol/client` with a fake mailbox; the session and mail tests run the real IMAP client against a scripted server on a local socket (`src/imap/fake-server.ts`). Nothing in the suite talks to a real mail server.
 
 The MCP Inspector does not inherit your shell environment, so pass the variables explicitly:
 
