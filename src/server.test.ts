@@ -52,7 +52,7 @@ function fakeMail(opts: { sendFails?: Error } = {}) {
 						uid: 7,
 						date: "2026-10-24T09:15:00+02:00",
 						from: ["Jan <jan@example.nl>"],
-						to: ["sebastiaan@icloud.com"],
+						to: ["me@icloud.com"],
 						subject: "Koffie?",
 						unread: true,
 						flagged: false,

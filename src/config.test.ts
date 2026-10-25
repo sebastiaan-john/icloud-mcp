@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { loadConfig } from "./config";
 
 const base = {
-	ICLOUD_EMAIL: "sebastiaan@icloud.com",
+	ICLOUD_EMAIL: "me@icloud.com",
 	ICLOUD_APP_PASSWORD: "abcd-efgh-ijkl-mnop",
 };
 
@@ -16,15 +16,15 @@ describe("loadConfig", () => {
 		expect(config.imap).toEqual({
 			host: "imap.mail.me.com",
 			port: 993,
-			user: "sebastiaan",
+			user: "me",
 			password: "abcd-efgh-ijkl-mnop",
 		});
 		expect(config.smtp).toMatchObject({
 			host: "smtp.mail.me.com",
 			port: 587,
-			user: "sebastiaan@icloud.com",
+			user: "me@icloud.com",
 		});
-		expect(config.from).toBe("sebastiaan@icloud.com");
+		expect(config.from).toBe("me@icloud.com");
 		expect(config.http).toBeUndefined();
 	});
 
@@ -49,7 +49,7 @@ describe("loadConfig", () => {
 			loadConfig({ ...base, ICLOUD_EMAIL: "hello@example.nl" }),
 		).toThrow("ICLOUD_FROM");
 		const config = loadConfig({ ...base, ICLOUD_FROM: "hello@example.nl" });
-		expect(config.imap.user).toBe("sebastiaan");
+		expect(config.imap.user).toBe("me");
 		expect(config.from).toBe("hello@example.nl");
 	});
 

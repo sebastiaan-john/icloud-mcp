@@ -3,7 +3,7 @@ import { compose, encodeQuotedPrintable, parseAddress } from "./compose";
 import { decodeCharset, decodeHeader, decodeTransfer } from "./decode";
 
 const message = {
-	from: "Sebastiaan Dijkstra <sebastiaan@icloud.com>",
+	from: "Jan Jansen <me@icloud.com>",
 	to: ["Jöhn Smith <john@example.com>", "jan@example.nl"],
 	cc: ['"Doe, Jane" <jane@example.com>'],
 	bcc: ["secret@example.com", "JAN@example.nl"],
